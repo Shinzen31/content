@@ -41,7 +41,8 @@ MAX_UPTAKE   = 10.0
 RESULT_DIR   = "results"
 EPS_BASE     = 1e-9            # ★factor：避免 baseline 为 0 时爆炸
 
-cobra.Configuration().solver = "glpk"
+cobra.Configuration().solver = "glpk" 
+'''cobra.Configuration().solver = "gurobi" '''
 
 # ─────────── Basic functions ───────────
 def apply_env(model: cobra.Model, env: dict[str, float], upper_bound: float = MAX_UPTAKE):
@@ -57,17 +58,22 @@ def avoid_zero_met(states, changes):
 
 def get_growth(model, env_names, env_state, sol0):
     uptake_bounds = {rid: env_state.get(rid, 0.0) / (env_state.get(rid, 0.0) + 1.0) for rid in env_names}
-    sol = apply_env(model, uptake_bounds)
-    mu = sol.objective_value
-    fluxes = {rid: (sol.fluxes.get(rid, 0.0) if model.reactions.has_id(rid) else 0.0) for rid in env_names}
+    solution = apply_env(model, uptake_bounds)
+    mu = solution.objective_value
+    fluxes = {rid: (solution.fluxes.get(rid, 0.0) if model.reactions.has_id(rid) else 0.0) for rid in env_names}
+    #print(f"{model.id} ： {mu} , {mu / sol0}\n")
     return mu / sol0, fluxes
 
 def simulate(models_orig, env_names, env_initial,
              *, t_span=TIME_SPAN, n_points=N_POINTS, show_plots=False):
     n_models = len(models_orig)
     base_models = [m.copy() for m in models_orig]
-    sol0s = [m.optimize().objective_value or 1e-9 for m in base_models]
 
+    base_models_applied_env = [apply_env(m, env_initial) for m in base_models]
+    '''sol0s = [m.optimize().objective_value or 1e-9 for m in base_models]'''
+    sol0s = [max(m.objective_value,1) for m in base_models_applied_env]
+    #print(f"this is sol10s:{sol0s}")
+    
     def ode(t, y):
         biomasses = np.maximum(y[:n_models], 0.0)
         mets = np.maximum(y[n_models:], 0.0)
@@ -83,9 +89,19 @@ def simulate(models_orig, env_names, env_initial,
 
     y0 = np.concatenate(([INIT_BIOMASS] * n_models,
                          [env_initial.get(r, 0.0) for r in env_names]))
+    
+    '''sol = solve_ivp(
+        ode,
+        t_span,
+        y0,
+        method="LSODA",
+        min_step=1.0,
+        t_eval=np.linspace(*t_span, n_points)
+    )'''
     sol = solve_ivp(ode, t_span, y0, t_eval=np.linspace(*t_span, n_points))
-    # 若需更稳健积分器，可改 BDF：
-    # sol = solve_ivp(ode, t_span, y0, method="BDF", t_eval=np.linspace(*t_span, n_points))
+    #print(sol.y)
+    # 若需更稳健积分器，可改 BDF：min step 1
+    # sol = solve_ivp(ode, t_span, y0, method="LSODA", t_eval=np.linspace(*t_span, n_points))
 
     if show_plots:
         # Figure 1: Biomass
