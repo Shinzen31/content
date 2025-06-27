@@ -3,7 +3,7 @@
 """
 Parallel scheduler for single-env dFBA runs  (chunk-wise)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-python run2.py --start_env 0 --stop_env 99 --chunk 5 --timeout 600
+python run.py --start_env 0 --stop_env 99 --chunk 5 --timeout 600
 """
 
 import argparse, os, subprocess, sys, gc, traceback
@@ -41,11 +41,12 @@ def create_placeholder(env: int, bs: int):
     out = os.path.join(RESULTS_DIR, f"dfba_final_biomass_env{env}_bs{bs}.csv")
     if os.path.exists(out):
         return
-    header = ("env_id,group_id,model_name,final_biomass,factor,"
+    # ★ header 增加 baseline_biomass 列
+    header = ("env_id,group_id,model_name,final_biomass,factor,baseline_biomass,"
               "best_target_biomass,best_target_factor,best_partner_names\n")
     with open(out, "w") as f:
         f.write(header)
-        f.write(f"{env},0,{TARGET_MODEL},0,0,0,0,\n")   # 仅目标行
+        f.write(f"{env},0,{TARGET_MODEL},0,0,0,0,0,\n")   # 仅目标行
 
 # ─────────── 统计频率 ───────────
 def collect_frequency():
