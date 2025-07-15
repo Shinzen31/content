@@ -1,29 +1,35 @@
 #!/bin/bash
 #$ -S /bin/bash
 #$ -N dfba_arr               # 作业名
-#$ -q long.q                 # 挑选支持128线程的 long.q
+#$ -q long.q                 # 选择支持大并发的队列
 #$ -cwd                      # 在当前目录运行
-#$ -t 0-99                   # 100 个 array task
-#$ -pe thread 128            # 每个 Task 占满整台节点的128个线程
-#$ -l h_vmem=4G              # 每 slot 4 GB，总共 128×4 GB = 512 GB
-#$ -l h_rt=168:00:00         # 如果需要可把单 task 最长时间调成队列上限（比如 7 天）
-#$ -o logs/dfba.$TASK_ID.out # 标准输出
-#$ -e logs/dfba.$TASK_ID.err # 标准错误
+#$ -t 1-100                  # 100 个 array task；ID = 1…100
+#$ -pe thread 128            # 每 task 占满整机 128 线程
+#$ -l h_vmem=4G              # 每 slot 4G，总共 512G，节点够用
+#$ -l h_rt=168:00:00         # 单 task 最长 168 小时（可按需调整）
+#$ -o logs/dfba.$TASK_ID.out
+#$ -e logs/dfba.$TASK_ID.err
 
 module load miniconda3
 source activate dfba
 
-# 每个 Task 负责 100 个环境
+# 每个 task 处理的 env 数
 ENV_PER_TASK=100
-START=$(( SGE_TASK_ID * ENV_PER_TASK ))
+
+# 由于 SGE_TASK_ID 从 1 开始，减 1 得到 0-based idx
+IDX=$(( SGE_TASK_ID - 1 ))
+START=$(( IDX * ENV_PER_TASK ))
 STOP=$(( START + ENV_PER_TASK - 1 ))
-[ $STOP -gt 9999 ] && STOP=9999
+# 最后一块不要超过 9999
+if [ $STOP -gt 9999 ]; then
+  STOP=9999
+fi
 
-echo "Task $SGE_TASK_ID handles env $START – $STOP"
+echo "Task $SGE_TASK_ID (idx=$IDX) handles env $START – $STOP"
 
-# 让 run.py 在每批并行 32 个 env、共 32×4=128 进程
+# 调用 run.py
 python run.py \
   --start_env $START \
   --stop_env  $STOP  \
   --chunk     32      \
-  --timeout   3600    # 可根据单批耗时再调大
+  --timeout   3600
