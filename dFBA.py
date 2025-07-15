@@ -7,17 +7,6 @@ Group-dynamic FBA runner (target-in-every-group) — single-environment mode
 • 保留原有全部计算 & 绘图逻辑  
 • 通过 --env 与 --bs 参数，可由外部调度脚本并行运行  
 • 结果写入 results/dfba_final_biomass_env{env}_bs{bs}.csv
-
-新增：
----------------------------------------------------------------------------
-1. baseline（目标单独生长）→ base_bio  
-2. factor  = final_biomass / base_bio  
-3. CSV 新列：
-   • factor
-   • baseline_biomass          ← ★ 新增
-   • best_target_factor
-   • best_partner_names
----------------------------------------------------------------------------
 """
 
 from __future__ import annotations
@@ -37,61 +26,71 @@ TARGET_FILE = "GCF_000010425.1_ASM1042v1_protein_gapfilled_noO2_appliedMedium.xm
 ENV_FILE    = "environment_ball.tsv"
 TIME_SPAN   = (0, 48)
 N_POINTS    = 40
-INIT_BIOMASS = 0.01
+INIT_BIOMASS = 0.1
 MAX_UPTAKE   = 10.0
 RESULT_DIR   = "results"
-EPS_BASE     = 1e-9            # ★factor：避免 baseline 为 0 时爆炸
+EPS_BASE     = 1e-9
+MONOD_CONSTANT = 10
+YIELD_FACTOR = 0.1
+WATER_CONSTANT = 10
 
-cobra.Configuration().solver = "glpk" 
+cobra.Configuration().solver = "glpk"
 # cobra.Configuration().solver = "gurobi"
 
 # ─────────── Basic functions ───────────
-def apply_env(model: cobra.Model, env: dict[str, float], upper_bound: float = MAX_UPTAKE):
+def apply_env(model: cobra.Model, env: dict[str, float],
+              upper_bound: float = MAX_UPTAKE):
     for rid, conc in env.items():
         if model.reactions.has_id(rid):
             rxn = model.reactions.get_by_id(rid)
             rxn.lower_bound = -abs(conc)
             rxn.upper_bound = upper_bound
+    model.reactions.EX_cpd00001_e0.lower_bound = WATER_CONSTANT
     return model.optimize()
 
 def avoid_zero_met(states, changes):
     return np.where(states + changes < 0, -states, changes)
 
-def get_growth(model, env_names, env_state, sol0):
-    uptake_bounds = {rid: env_state.get(rid, 0.0) / (env_state.get(rid, 0.0) + 1.0) for rid in env_names}
+def get_growth(model, env_names, env_state):
+    uptake_bounds = {rid: env_state.get(rid, 0.0) /
+                     (env_state.get(rid, 0.0) + MONOD_CONSTANT)
+                     for rid in env_names}
     solution = apply_env(model, uptake_bounds)
-    mu = solution.objective_value
-    fluxes = {rid: (solution.fluxes.get(rid, 0.0) if model.reactions.has_id(rid) else 0.0) for rid in env_names}
-    return mu / sol0, fluxes
+    mu = solution.objective_value #* 0.1
+    fluxes = {}
+    for rid in env_names:
+        if model.reactions.has_id(rid):
+            v = solution.fluxes.get(rid, 0.0)
+            fluxes[rid] = v * YIELD_FACTOR if v > 0 else v
+        else:
+            fluxes[rid] = 0.0              # ← FIX: 确保键存在
+    return mu, fluxes
 
 def simulate(models_orig, env_names, env_initial,
              *, t_span=TIME_SPAN, n_points=N_POINTS, show_plots=False):
     n_models = len(models_orig)
-    base_models = [m.copy() for m in models_orig]
 
-    base_models_applied_env = [apply_env(m, env_initial) for m in base_models]
-    sol0s = [max(m.objective_value, 1) for m in base_models_applied_env]
-    
     def ode(t, y):
         biomasses = np.maximum(y[:n_models], 0.0)
-        mets = np.maximum(y[n_models:], 0.0)
+        mets      = np.maximum(y[n_models:], 0.0)
         env_state = dict(zip(env_names, mets))
-        d_bio = np.zeros(n_models)
+
+        d_bio  = np.zeros(n_models)
         d_mets = np.zeros_like(mets)
+
         for i in range(n_models):
-            mu_norm, fluxes = get_growth(base_models[i], env_names, env_state, sol0s[i])
-            d_bio[i] = mu_norm * biomasses[i]
-            d_mets += biomasses[i] * np.array([fluxes[r] for r in env_names])
+            mu_norm, fluxes = get_growth(models_orig[i], env_names, env_state)
+            d_bio[i]  = mu_norm * biomasses[i]
+            d_mets   += biomasses[i] * np.array([fluxes[r] for r in env_names])
+
         d_mets = avoid_zero_met(mets, d_mets)
         return np.concatenate((d_bio, d_mets))
 
     y0 = np.concatenate(([INIT_BIOMASS] * n_models,
                          [env_initial.get(r, 0.0) for r in env_names]))
-    
     sol = solve_ivp(ode, t_span, y0, t_eval=np.linspace(*t_span, n_points))
 
     if show_plots:
-        # Figure 1: Biomass
         plt.figure(figsize=(6, 4))
         for i in range(n_models):
             plt.plot(sol.t, sol.y[i], label=f"Pop {i+1}")
@@ -99,7 +98,6 @@ def simulate(models_orig, env_names, env_initial,
         plt.title("Group Population Growth")
         plt.legend(); plt.tight_layout(); plt.show()
 
-        # Figure 2: Metabolites
         plt.figure(figsize=(6, 4))
         for j, rid in enumerate(env_names):
             plt.plot(sol.t, sol.y[n_models + j], label=rid)
@@ -112,7 +110,8 @@ def simulate(models_orig, env_names, env_initial,
 # ─────────── Utility functions ───────────
 def load_environment_ball(path: str | Path):
     tbl = pd.read_csv(path, sep="\t")
-    tbl["concentration"] = pd.to_numeric(tbl["concentration"], errors="coerce").fillna(0.0)
+    tbl["concentration"] = pd.to_numeric(tbl["concentration"],
+                                         errors="coerce").fillna(0.0)
     if "env_id" in tbl.columns:
         for _, g in tbl.groupby("env_id"):
             yield dict(zip(g["metabolite_id"], g["concentration"]))
@@ -145,10 +144,10 @@ def run_single_env(env_id: int, batch_size: int, show_plots=False):
     num_groups = ceil(len(other_paths) / chunk) if other_paths else 1
     records  = []
 
-    # ─── baseline: 目标单独生长 ────────────────────────
+    # ─── baseline ───────────────────────────────────
     solo_model  = cobra.io.read_sbml_model(target_path)
     base_sol    = simulate([solo_model], env_names, env)
-    base_bio    = base_sol.y[0, -1] or EPS_BASE      # ★ baseline biomass
+    base_bio    = base_sol.y[0, -1] or EPS_BASE
     print(f"[Baseline] target alone biomass = {base_bio:.6f}")
 
     print(f"\n=== Environment {env_id}  (batch_size={batch_size}) ===")
@@ -172,7 +171,6 @@ def run_single_env(env_id: int, batch_size: int, show_plots=False):
             print(f"   {p.name:<40} final biomass = {final_bio:>8.4f}"
                   f"{' | factor = %.4f' % factor if is_target else ''}")
 
-            # ★ 记录 baseline_biomass（目标行为 base_bio，其余填 NaN）
             records.append(dict(
                 env_id=env_id,
                 group_id=g_idx,
@@ -201,7 +199,6 @@ def run_single_env(env_id: int, batch_size: int, show_plots=False):
     df["best_target_factor"]  = best_factor
     df["best_partner_names"]  = ";".join(best_partners)
 
-    # 列顺序：与 header/placeholder 保持一致
     ordered = ["env_id","group_id","model_name",
                "final_biomass","factor","baseline_biomass",
                "best_target_biomass","best_target_factor","best_partner_names"]
@@ -225,11 +222,11 @@ if __name__ == "__main__":
     if args.env is None and (args.env_start is None or args.env_stop is None):
         parser.error("Either --env or both --env_start/--env_stop must be specified")
 
-    if args.env is not None:      # 单 env
+    if args.env is not None:
         run_single_env(args.env, args.batch_size, args.plot)
-    else:                         # 连续多 env
+    else:
         for eid in range(args.env_start, args.env_stop + 1):
             run_single_env(eid, args.batch_size, args.plot)
 
     gc.collect()
-    os._exit(0)                   # 强制退出，避免残留线程
+    os._exit(0)
