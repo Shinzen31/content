@@ -3,7 +3,7 @@
 """
 Parallel scheduler for single-env dFBA runs  (chunk-wise)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-python run.py --start_env 0 --stop_env 99 --chunk 5 --timeout 600
+python run.py --start_env 0 --stop_env 99 --chunk 3 --timeout 600
 """
 
 import argparse, os, subprocess, sys, gc, traceback
