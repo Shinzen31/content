@@ -1,9 +1,8 @@
 #!/bin/bash
 #
 # run_parallel8.sh
-# 8 并发 dFBA 区间任务；每任务独立子目录，避免输出冲突；
-# 首次调用自动以 nohup 后台自守护（断开 SSH 继续跑）；
-# 路径基于 /home/chlu/work/* ；无需修改 run.py/dFBA.py。
+# 8 并发 dFBA 区间任务；每任务独立子目录；自动 nohup 守护；
+# 为子任务目录建立脚本/数据符号链接，避免相对路径问题。
 
 ###############################################################################
 # 自守护：如非 nohup 环境，重启自身到后台并退出前台
@@ -21,35 +20,34 @@ fi
 # 基础路径
 ###############################################################################
 WORKROOT=/home/chlu/work
-ENVBASE=$WORKROOT/conda_envs/base          # 解包后的 Conda 环境
-WORKDIR=$WORKROOT/content                  # run.py / dFBA.py / 数据
-PARLOG=$WORKDIR/logs_parallel8             # 各并发任务启动日志
-OUT_BASE=$WORKDIR/task_outputs8            # 各并发任务工作目录根
+ENVBASE=$WORKROOT/conda_envs/base
+WORKDIR=$WORKROOT/content
+PARLOG=$WORKDIR/logs_parallel8
+OUT_BASE=$WORKDIR/task_outputs8
 
 mkdir -p "$PARLOG" "$OUT_BASE"
 
 ###############################################################################
 # 任务划分参数
 ###############################################################################
-TOTAL_ENV=10000        # env_id: 0..9999
-TASKS=8                # 并发块数
-TIMEOUT=5400           # run.py --timeout
-CHUNK=4                # run.py --chunk
+TOTAL_ENV=10000
+TASKS=8
+TIMEOUT=5400
+CHUNK=4
 
 ###############################################################################
-# 使用解包 Conda 环境（无需 module load / conda activate）
+# 环境
 ###############################################################################
 export PATH="$ENVBASE/bin:$PATH"
 export LD_LIBRARY_PATH="$ENVBASE/lib:$LD_LIBRARY_PATH"
 
-# 快测 cobra
 python - <<'EOF' || { echo "[FATAL] Conda env import失败" >&2; exit 1; }
 import cobra
 print("cobra OK:", cobra.__version__)
 EOF
 
 ###############################################################################
-# 计算每块起止 env（前 REM 块多 1 个）
+# 分段
 ###############################################################################
 BASE_SIZE=$(( TOTAL_ENV / TASKS ))
 REM=$(( TOTAL_ENV % TASKS ))
@@ -73,9 +71,11 @@ for (( i=0; i<TASKS; i++ )); do
     echo "  Logs   : stdout.log, stderr.log"
   } >"$LOG_OUT"
 
-  # 后台启动：先 cd 到任务目录；建符号链接供 dFBA.py 读取相对路径数据
+  # 注意：我们在任务目录里创建脚本/数据链接，解决 run.py 子进程找不到 dFBA.py 问题
   nohup bash -c "
     cd $TASKDIR
+    ln -sf $WORKDIR/dFBA.py dFBA.py
+    ln -sf $WORKDIR/run.py run.py
     ln -sf $WORKDIR/environment_ball.tsv environment_ball.tsv
     ln -sf $WORKDIR/models_gapfilled models_gapfilled
 
