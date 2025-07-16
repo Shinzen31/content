@@ -2,7 +2,13 @@
 #
 # run_parallel8.sh
 # 8 并发 dFBA 区间任务；每任务独立子目录；自动 nohup 守护；
-# 为子任务目录建立脚本/数据符号链接，避免相对路径问题。
+# 为子任务目录建立脚本/数据符号链接；强制无缓冲输出便于 tail -f 监控。
+#
+# 使用步骤：
+#   cd /home/chlu/work/content
+#   chmod +x run_parallel8.sh
+#   ./run_parallel8.sh          # 前台立刻返回；后台运行
+#
 
 ###############################################################################
 # 自守护：如非 nohup 环境，重启自身到后台并退出前台
@@ -28,19 +34,22 @@ OUT_BASE=$WORKDIR/task_outputs8
 mkdir -p "$PARLOG" "$OUT_BASE"
 
 ###############################################################################
-# 任务划分参数
+# 任务参数
 ###############################################################################
-TOTAL_ENV=10000
+TOTAL_ENV=10000      # env_id: 0..9999
 TASKS=8
 TIMEOUT=5400
 CHUNK=4
 
 ###############################################################################
-# 环境
+# 环境：使用解包 Conda 环境
 ###############################################################################
 export PATH="$ENVBASE/bin:$PATH"
 export LD_LIBRARY_PATH="$ENVBASE/lib:$LD_LIBRARY_PATH"
+# Python 无缓冲（即使前面忘记 -u）
+export PYTHONUNBUFFERED=1
 
+# 验证 cobra
 python - <<'EOF' || { echo "[FATAL] Conda env import失败" >&2; exit 1; }
 import cobra
 print("cobra OK:", cobra.__version__)
@@ -71,21 +80,24 @@ for (( i=0; i<TASKS; i++ )); do
     echo "  Logs   : stdout.log, stderr.log"
   } >"$LOG_OUT"
 
-  # 注意：我们在任务目录里创建脚本/数据链接，解决 run.py 子进程找不到 dFBA.py 问题
-  nohup bash -c "
-    cd $TASKDIR
-    ln -sf $WORKDIR/dFBA.py dFBA.py
-    ln -sf $WORKDIR/run.py run.py
-    ln -sf $WORKDIR/environment_ball.tsv environment_ball.tsv
-    ln -sf $WORKDIR/models_gapfilled models_gapfilled
+  # 这里用一整段单引号 EOF 实体脚本，避免反斜线续行问题
+  nohup bash <<EOF >>"$LOG_OUT" 2>>"$LOG_ERR" &
+cd "$TASKDIR"
 
-    /usr/bin/time -v $ENVBASE/bin/python $WORKDIR/run.py \
-      --start_env $START \
-      --stop_env  $STOP \
-      --chunk     $CHUNK \
-      --timeout   $TIMEOUT \
-      > stdout.log 2> stderr.log
-  " >>"$LOG_OUT" 2>>"$LOG_ERR" &
+# 数据/脚本链接（相对路径兼容 run.py 子进程）
+ln -sf "$WORKDIR/dFBA.py"              dFBA.py
+ln -sf "$WORKDIR/run.py"               run.py
+ln -sf "$WORKDIR/environment_ball.tsv" environment_ball.tsv
+ln -sf "$WORKDIR/models_gapfilled"     models_gapfilled
+
+# 行缓冲输出：stdbuf -oL -eL
+stdbuf -oL -eL /usr/bin/time -v "$ENVBASE/bin/python" -u "$WORKDIR/run.py" \
+  --start_env $START \
+  --stop_env  $STOP \
+  --chunk     $CHUNK \
+  --timeout   $TIMEOUT \
+  > stdout.log 2> stderr.log
+EOF
 
   PID=$!
   echo "  PID $PID" >>"$LOG_OUT"
