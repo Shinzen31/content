@@ -1,55 +1,55 @@
 #!/bin/bash
 #
-# run_parallel8_daemon.sh
-# 8 并发 dFBA 区间任务；每任务独立子目录；nohup+disown 自我守护；
-# 断开 SSH 后继续运行；路径全部基于 /home/chlu/work/* 。
+# run_parallel8.sh
+# 8 并发 dFBA 区间任务；每任务独立子目录，避免输出冲突；
+# 首次调用自动以 nohup 后台自守护（断开 SSH 继续跑）；
+# 路径基于 /home/chlu/work/* ；无需修改 run.py/dFBA.py。
 
 ###############################################################################
-# 自我守护：若首次调用（尚未在 nohup 下），重新以 nohup+disown 后台启动自身并退出前台进程
+# 自守护：如非 nohup 环境，重启自身到后台并退出前台
 ###############################################################################
 if [[ -z "$NOHUP_STARTED" ]]; then
   export NOHUP_STARTED=1
-  mkdir -p logs_parallel8   # 临时目录（前台阶段也可记录）
+  mkdir -p logs_parallel8
   echo "[INFO] Relaunching under nohup..." > logs_parallel8/master.out
   nohup bash "$0" "$@" >> logs_parallel8/master.out 2>&1 &
-  disown
   echo "[INFO] Daemonized. Master log: logs_parallel8/master.out"
   exit 0
 fi
 
 ###############################################################################
-# 基础路径（全部从 /home/chlu/work 开始）
+# 基础路径
 ###############################################################################
 WORKROOT=/home/chlu/work
-ENVBASE=$WORKROOT/conda_envs/base          # 解包后的 Conda 环境前缀
+ENVBASE=$WORKROOT/conda_envs/base          # 解包后的 Conda 环境
 WORKDIR=$WORKROOT/content                  # run.py / dFBA.py / 数据
 PARLOG=$WORKDIR/logs_parallel8             # 各并发任务启动日志
-OUT_BASE=$WORKDIR/task_outputs8            # 各并发任务工作区根
+OUT_BASE=$WORKDIR/task_outputs8            # 各并发任务工作目录根
 
 mkdir -p "$PARLOG" "$OUT_BASE"
 
 ###############################################################################
 # 任务划分参数
 ###############################################################################
-TOTAL_ENV=10000        # env_id 范围：0..9999
+TOTAL_ENV=10000        # env_id: 0..9999
 TASKS=8                # 并发块数
 TIMEOUT=5400           # run.py --timeout
 CHUNK=4                # run.py --chunk
 
 ###############################################################################
-# 环境：使用解包 Conda（无需 module load / conda activate）
+# 使用解包 Conda 环境（无需 module load / conda activate）
 ###############################################################################
 export PATH="$ENVBASE/bin:$PATH"
 export LD_LIBRARY_PATH="$ENVBASE/lib:$LD_LIBRARY_PATH"
 
-# 快速验证 cobra
-python - <<'EOF' || { echo "[FATAL] Conda env import 失败" >&2; exit 1; }
+# 快测 cobra
+python - <<'EOF' || { echo "[FATAL] Conda env import失败" >&2; exit 1; }
 import cobra
 print("cobra OK:", cobra.__version__)
 EOF
 
 ###############################################################################
-# 计算每块起止 env（负载均衡：前 REM 块 +1）
+# 计算每块起止 env（前 REM 块多 1 个）
 ###############################################################################
 BASE_SIZE=$(( TOTAL_ENV / TASKS ))
 REM=$(( TOTAL_ENV % TASKS ))
@@ -69,13 +69,16 @@ for (( i=0; i<TASKS; i++ )); do
 
   {
     echo "[$(date)] Launch task $i env ${START}-${STOP}"
-    echo "  Workdir: $TASKDIR"
-    echo "  Logs   : $TASKDIR/stdout.log , $TASKDIR/stderr.log"
+    echo "  WORKDIR: $TASKDIR"
+    echo "  Logs   : stdout.log, stderr.log"
   } >"$LOG_OUT"
 
-  # 后台启动：切换到该任务独立目录；run.py 写出的 results/* 都隔离在此
+  # 后台启动：先 cd 到任务目录；建符号链接供 dFBA.py 读取相对路径数据
   nohup bash -c "
     cd $TASKDIR
+    ln -sf $WORKDIR/environment_ball.tsv environment_ball.tsv
+    ln -sf $WORKDIR/models_gapfilled models_gapfilled
+
     /usr/bin/time -v $ENVBASE/bin/python $WORKDIR/run.py \
       --start_env $START \
       --stop_env  $STOP \
@@ -86,10 +89,14 @@ for (( i=0; i<TASKS; i++ )); do
 
   PID=$!
   echo "  PID $PID" >>"$LOG_OUT"
-  disown %$PID
 
   START=$(( STOP + 1 ))
 done
 
-echo "[$(date)] All $TASKS tasks launched. Master logs: $PARLOG ; outputs: $OUT_BASE" >> "$PARLOG/master.out"
-echo "All tasks launched."
+{
+  echo "[$(date)] All $TASKS tasks launched."
+  echo "Master log: $PARLOG/master.out"
+  echo "Outputs: $OUT_BASE/task0 ... task$((TASKS-1))"
+} >> "$PARLOG/master.out"
+
+echo "All tasks launched. Logs in $PARLOG, outputs in $OUT_BASE"
