@@ -11,19 +11,22 @@
 #
 
 ###############################################################################
-# 自守护：如非 nohup 环境，重启自身到后台并退出前台
+# 自守护：若非 nohup 环境则重启自身到后台并退出前台
 ###############################################################################
-if [[ -z "$NOHUP_STARTED" ]]; then
+if [[ -z "${NOHUP_STARTED:-}" ]]; then
   export NOHUP_STARTED=1
   mkdir -p logs_parallel8
   echo "[INFO] Relaunching under nohup..." > logs_parallel8/master.out
+  # 将所有参数透传
   nohup bash "$0" "$@" >> logs_parallel8/master.out 2>&1 &
   echo "[INFO] Daemonized. Master log: logs_parallel8/master.out"
   exit 0
 fi
 
+set -euo pipefail
+
 ###############################################################################
-# 基础路径
+# 基础路径（按需修改）
 ###############################################################################
 WORKROOT=/home/chlu/work
 ENVBASE=$WORKROOT/conda_envs/base
@@ -34,39 +37,73 @@ OUT_BASE=$WORKDIR/task_outputs8
 mkdir -p "$PARLOG" "$OUT_BASE"
 
 ###############################################################################
-# 任务参数
+# Conda 环境检查（一次性；失败立即退出）
 ###############################################################################
-TOTAL_ENV=10000      # env_id: 0..9999
-TASKS=8
-TIMEOUT=5400
-CHUNK=4
-
-###############################################################################
-# 环境：使用解包 Conda 环境
-###############################################################################
-export PATH="$ENVBASE/bin:$PATH"
-export LD_LIBRARY_PATH="$ENVBASE/lib:$LD_LIBRARY_PATH"
-# Python 无缓冲（即使前面忘记 -u）
-export PYTHONUNBUFFERED=1
-
-# 验证 cobra
-python - <<'EOF' || { echo "[FATAL] Conda env import失败" >&2; exit 1; }
+echo "[INFO] Checking cobra import from $ENVBASE..." | tee -a "$PARLOG/master.out"
+if ! "$ENVBASE/bin/python" - <<'EOF' 2>>"$PARLOG/master.out" >>"$PARLOG/master.out"; then
 import cobra
 print("cobra OK:", cobra.__version__)
 EOF
+then
+  echo "[FATAL] Conda env import失败" | tee -a "$PARLOG/master.out"
+  exit 1
+fi
 
 ###############################################################################
-# 分段
+# 自动检测 environment_ball.tsv 的 env 数目
+# 兼容含 env_id 列或按块分割（与 dFBA.py 相同逻辑）
 ###############################################################################
-BASE_SIZE=$(( TOTAL_ENV / TASKS ))
-REM=$(( TOTAL_ENV % TASKS ))
+ENV_TSV="$WORKDIR/environment_ball.tsv"
+if [[ ! -f "$ENV_TSV" ]]; then
+  echo "[FATAL] Not found: $ENV_TSV" | tee -a "$PARLOG/master.out"
+  exit 1
+fi
 
-START=0
-for (( i=0; i<TASKS; i++ )); do
-  EXTRA=$(( i < REM ? 1 : 0 ))
-  SIZE=$(( BASE_SIZE + EXTRA ))
-  STOP=$(( START + SIZE - 1 ))
-  (( STOP >= TOTAL_ENV )) && STOP=$(( TOTAL_ENV - 1 ))
+TOTAL_ENV=$("$ENVBASE/bin/python" - <<EOF)
+import pandas as pd, sys
+df = pd.read_csv("$ENV_TSV", sep="\t")
+if "env_id" in df.columns:
+    print(df["env_id"].nunique())
+else:
+    n_met = df["metabolite_id"].nunique()
+    print(len(df) // n_met)
+EOF
+)
+echo "[INFO] Detected $TOTAL_ENV environments (env_id 0..$((TOTAL_ENV-1)))." | tee -a "$PARLOG/master.out"
+
+###############################################################################
+# 任务参数（可根据需要覆写环境变量）
+###############################################################################
+TASKS=${TASKS:-8}           # 并发数量
+TIMEOUT=${TIMEOUT:-5400}    # run.py 子任务 --timeout
+CHUNK=${CHUNK:-4}           # run.py 子任务 --chunk
+
+# 可通过环境变量 START_ENV / STOP_ENV 覆写范围；默认全范围
+START_ENV=${START_ENV:-0}
+STOP_ENV=${STOP_ENV:-$((TOTAL_ENV-1))}
+
+echo "[INFO] Master will distribute env_id $START_ENV..$STOP_ENV across $TASKS tasks." \
+  | tee -a "$PARLOG/master.out"
+echo "[INFO] Per-run.py chunk=$CHUNK timeout=$TIMEOUT sec." \
+  | tee -a "$PARLOG/master.out"
+
+###############################################################################
+# 计算每个任务的分配区间（尽量均匀）
+###############################################################################
+TOTAL_RANGE=$(( STOP_ENV - START_ENV + 1 ))
+BASE_SIZE=$(( TOTAL_RANGE / TASKS ))
+REM=$(( TOTAL_RANGE % TASKS ))
+
+###############################################################################
+# 启动 TASKS 个后台任务
+###############################################################################
+pids=()
+
+for (( i=0, start=$START_ENV; i<TASKS; i++ )); do
+  extra=$(( i < REM ? 1 : 0 ))
+  size=$(( BASE_SIZE + extra ))
+  stop=$(( start + size - 1 ))
+  (( stop > STOP_ENV )) && stop=$STOP_ENV
 
   TASKDIR=$OUT_BASE/task${i}
   mkdir -p "$TASKDIR"
@@ -75,40 +112,48 @@ for (( i=0; i<TASKS; i++ )); do
   LOG_ERR=$PARLOG/task${i}.launcher.err
 
   {
-    echo "[$(date)] Launch task $i env ${START}-${STOP}"
+    echo "[$(date)] Launch task $i env ${start}-${stop}"
     echo "  WORKDIR: $TASKDIR"
     echo "  Logs   : stdout.log, stderr.log"
   } >"$LOG_OUT"
 
-  # 这里用一整段单引号 EOF 实体脚本，避免反斜线续行问题
-  nohup bash <<EOF >>"$LOG_OUT" 2>>"$LOG_ERR" &
-cd "$TASKDIR"
+  # 在子 shell 中运行任务（不再二次 nohup；主进程本身已 nohup）
+  (
+    set -euo pipefail
+    cd "$TASKDIR"
 
-# 数据/脚本链接（相对路径兼容 run.py 子进程）
-ln -sf "$WORKDIR/dFBA.py"              dFBA.py
-ln -sf "$WORKDIR/run.py"               run.py
-ln -sf "$WORKDIR/environment_ball.tsv" environment_ball.tsv
-ln -sf "$WORKDIR/models_gapfilled"     models_gapfilled
+    # 建立脚本 / 数据符号链接（覆盖旧链接）
+    ln -sfn "$WORKDIR/dFBA.py"              dFBA.py
+    ln -sfn "$WORKDIR/run.py"               run.py
+    ln -sfn "$WORKDIR/environment_ball.tsv" environment_ball.tsv
+    ln -sfn "$WORKDIR/models_gapfilled"     models_gapfilled
 
-# 行缓冲输出：stdbuf -oL -eL
-stdbuf -oL -eL /usr/bin/time -v "$ENVBASE/bin/python" -u "$WORKDIR/run.py" \
-  --start_env $START \
-  --stop_env  $STOP \
-  --chunk     $CHUNK \
-  --timeout   $TIMEOUT \
-  > stdout.log 2> stderr.log
-EOF
+    # 无缓冲输出：python -u；stdbuf用于 /usr/bin/time 产生输出行缓冲
+    stdbuf -oL -eL /usr/bin/time -v "$ENVBASE/bin/python" -u ./run.py \
+      --start_env "$start" \
+      --stop_env  "$stop" \
+      --chunk     "$CHUNK" \
+      --timeout   "$TIMEOUT" \
+      > stdout.log 2> stderr.log
+  ) >>"$LOG_OUT" 2>>"$LOG_ERR" &
 
-  PID=$!
-  echo "  PID $PID" >>"$LOG_OUT"
+  pid=$!
+  echo "  PID $pid" >>"$LOG_OUT"
+  pids+=("$pid")
 
-  START=$(( STOP + 1 ))
+  start=$(( stop + 1 ))
+  (( start > STOP_ENV )) && break
 done
 
+###############################################################################
+# 打印 PID 列表到 master log 并退出（任务后台持续）
+###############################################################################
 {
-  echo "[$(date)] All $TASKS tasks launched."
+  echo "[$(date)] All $TASKS tasks launched (some may have empty ranges if STOP_ENV small)."
   echo "Master log: $PARLOG/master.out"
-  echo "Outputs: $OUT_BASE/task0 ... task$((TASKS-1))"
+  echo "PIDs: ${pids[*]}"
+  echo "Tail individual task launchers in $PARLOG/taskN.launcher.out and .err."
+  echo "Tail runtime logs in $OUT_BASE/taskN/stdout.log (and stderr.log)."
 } >> "$PARLOG/master.out"
 
 echo "All tasks launched. Logs in $PARLOG, outputs in $OUT_BASE"
