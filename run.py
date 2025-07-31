@@ -1,265 +1,354 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Parallel scheduler for single-env dFBA runs (chunk-wise)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-示例：
-    python run.py --start_env 0 --stop_env 3 --chunk 4 --timeout 1200 --plot
+Group-dynamic FBA runner (target-in-every-group) — single-environment mode
+=========================================================================
+• 与旧版等价的计算 & 输出格式  
+• 固定切片 → Beam Search（保证满员）  
+• GLPK 求解器，任何 infeasible → μ = 0（避免子进程崩溃）
 
-2025-07-31
------------
-* 回退到 2025-07-15 的调度 / 合并逻辑，解决子进程 stdout 堵塞
-* trajectory 快照 + 2×2 子图绘制
-* **新增 --plot 开关**；默认不绘图，可按需开启
-* 绘图改进：
-    - 过滤掉始终为 0 的“伪伙伴”曲线（解决 bs=2 却出现 4 条线的问题）
-    - 图例放到图外顶部，动态计算 ncol，避免被截断
+2025-07-31 变更摘要
+------------------
+* **Beam Search** 评分重新采用 μ_now / μ_base  
+  - μ_base: 目标单独培养的最优生长率  
+  - μ_now : 加入候选伙伴组合后的最优生长率  
+* **内存泄漏修复**：Beam Search 阶段不再一次性加载全部伙伴模型。  
+* 去掉 `os._exit(0)`，让 traceback 能正常冒泡。
 """
+from __future__ import annotations
+
 import argparse
 import gc
-import itertools
-import os
-import shutil
-import subprocess
 import sys
 import traceback
-from math import ceil
 from pathlib import Path
 
+import cobra
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
+from scipy.integrate import solve_ivp
 
-# ─────────── 常量 ───────────
-RESULTS_DIR = "results"
-TRAJ_DIR    = "trajectories"
-PLOT_DIR    = "plots"
-TARGET_MODEL = "GCF_000010425.1_ASM1042v1_protein_gapfilled_noO2_appliedMedium.xml"
+# ───────────────── Parameters ──────────────────
+MODEL_DIR   = "models_gapfilled"
+TARGET_FILE = "GCF_000010425.1_ASM1042v1_protein_gapfilled_noO2_appliedMedium.xml"
+ENV_FILE    = "environment_ball.tsv"
+TRAJ_DIR    = "trajectories"             # ← 新增：轨迹输出目录
+TIME_SPAN   = (0, 48)          # 小时
+N_POINTS    = 40
+INIT_BIOMASS = 0.1
+MAX_UPTAKE   = 10.0
+RESULT_DIR   = "results"
+EPS_BASE     = 1e-9
+MONOD_CONSTANT = 10
+YIELD_FACTOR   = 0.1            # 分泌通量按产量系数缩放
+WATER_CONSTANT = 10             # EX_cpd00001_e0 下限
+BEAM_WIDTH     = 5              # Beam Search 保留前 B 个候选组
 
-# ─────────── 合并单 env-bs 结果 ───────────
-def merge_one(env: int, bs: int):
-    """
-    把 dfba_final_biomass_env{env}_bs{bs}.csv 合并进
-    results_bs{bs}/dfba_final_biomass.csv（覆盖同 env 行）
-    """
-    src = Path(RESULTS_DIR) / f"dfba_final_biomass_env{env}_bs{bs}.csv"
-    if not src.exists():
-        print(f"⚠️  Missing {src}")
-        return
+cobra.Configuration().solver = "glpk"
 
-    dst_dir = Path(f"results_bs{bs}")
-    dst_dir.mkdir(exist_ok=True)
-    dst = dst_dir / "dfba_final_biomass.csv"
+# ─────────── 基础工具函数 ───────────
+def apply_env(model: cobra.Model, env: dict[str, float],
+              *, upper_bound: float = MAX_UPTAKE):
+    """给模型施加摄取上限，在当前环境浓度下优化并返回 solution。"""
+    for rid, conc in env.items():
+        if model.reactions.has_id(rid):
+            rxn = model.reactions.get_by_id(rid)
+            rxn.lower_bound = -abs(conc)
+            rxn.upper_bound = upper_bound
+    # 保证水可排出
+    model.reactions.EX_cpd00001_e0.lower_bound = WATER_CONSTANT
+    return model.optimize()
 
-    df_new = pd.read_csv(src)
-    if dst.exists():
-        df = pd.read_csv(dst)
-        df = df[df["env_id"] != env]            # 覆盖同 env 行
-        df = pd.concat([df, df_new], ignore_index=True)
+
+def avoid_zero_met(states: np.ndarray, changes: np.ndarray) -> np.ndarray:
+    """阻止代谢物浓度降到负值。"""
+    return np.where(states + changes < 0, -states, changes)
+
+
+def get_growth(model: cobra.Model,
+               env_names: list[str],
+               env_state: dict[str, float]) -> tuple[float, dict[str, float]]:
+    """返回 (μ, 通量字典)。任何 infeasible 均视为 μ=0。"""
+    uptake_bounds = {rid: env_state.get(rid, 0.0) /
+                     (env_state.get(rid, 0.0) + MONOD_CONSTANT)
+                     for rid in env_names}
+    try:
+        solution = apply_env(model, uptake_bounds)
+        mu = solution.objective_value or 0.0
+    except Exception:
+        mu = 0.0
+        solution = None
+
+    fluxes: dict[str, float] = {}
+    for rid in env_names:
+        if solution and model.reactions.has_id(rid):
+            v = solution.fluxes.get(rid, 0.0)
+            fluxes[rid] = v * YIELD_FACTOR if v > 0 else v
+        else:
+            fluxes[rid] = 0.0
+    return mu, fluxes
+
+
+def simulate(models_orig: list[cobra.Model],
+             env_names: list[str],
+             env_initial: dict[str, float],
+             *,
+             t_span=TIME_SPAN,
+             n_points=N_POINTS,
+             show_plots=False):
+    """积分求解 dFBA 动力学，返回 OdeResult。"""
+    n_models = len(models_orig)
+
+    def ode(t, y):
+        biomasses = np.maximum(y[:n_models], 0.0)
+        mets      = np.maximum(y[n_models:], 0.0)
+        env_state = dict(zip(env_names, mets))
+
+        d_bio  = np.zeros(n_models)
+        d_mets = np.zeros_like(mets)
+
+        for i in range(n_models):
+            mu_norm, fluxes = get_growth(models_orig[i], env_names, env_state)
+            d_bio[i] = mu_norm * biomasses[i]
+            d_mets  += biomasses[i] * np.array([fluxes[r] for r in env_names])
+
+        d_mets = avoid_zero_met(mets, d_mets)
+        return np.concatenate((d_bio, d_mets))
+
+    y0 = np.concatenate(
+        ([INIT_BIOMASS] * n_models,
+         [env_initial.get(r, 0.0) for r in env_names])
+    )
+    sol = solve_ivp(ode, t_span, y0, t_eval=np.linspace(*t_span, n_points))
+
+    if show_plots:
+        plt.figure(figsize=(6, 4))
+        for i in range(n_models):
+            plt.plot(sol.t, sol.y[i], label=f"Pop {i+1}")
+        plt.xlabel("Time (h)")
+        plt.ylabel("Biomass")
+        plt.title("Group Population Growth")
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+        plt.figure(figsize=(6, 4))
+        for j, rid in enumerate(env_names):
+            plt.plot(sol.t, sol.y[n_models + j], label=rid)
+        plt.xlabel("Time (h)")
+        plt.ylabel("Concentration")
+        plt.title("Environment Metabolite Dynamics")
+        plt.legend(ncol=2, fontsize=7)
+        plt.tight_layout()
+        plt.show()
+
+    return sol
+
+# ─────────── 文件 / 迭代工具 ───────────
+def load_environment_ball(path: str | Path):
+    """逐个环境返回 {metabolite_id: concentration} dict。"""
+    tbl = pd.read_csv(path, sep="\t")
+    tbl["concentration"] = pd.to_numeric(tbl["concentration"],
+                                         errors="coerce").fillna(0.0)
+
+    if "env_id" in tbl.columns:
+        for _, g in tbl.groupby("env_id"):
+            yield dict(zip(g["metabolite_id"], g["concentration"]))
     else:
-        df = df_new
+        n_met = tbl["metabolite_id"].nunique()
+        for i in range(len(tbl)//n_met):
+            chunk = tbl.iloc[i*n_met:(i+1)*n_met]
+            yield dict(zip(chunk["metabolite_id"], chunk["concentration"]))
 
-    df = df.sort_values(["env_id", "group_id", "model_name"])
-    df.to_csv(dst, index=False)
 
-# ─────────── 占位文件（超时 / 崩溃） ───────────
-def create_placeholder(env: int, bs: int):
-    out = Path(RESULTS_DIR) / f"dfba_final_biomass_env{env}_bs{bs}.csv"
-    if out.exists():
-        return
-    Path(RESULTS_DIR).mkdir(exist_ok=True)
-    header = ("env_id,group_id,model_name,final_biomass,factor,baseline_biomass,"
-              "best_target_biomass,best_target_factor,best_partner_names\n")
-    out.write_text(header + f"{env},0,{TARGET_MODEL},0,0,0,0,0,\n")
+def iter_model_paths(model_dir: str | Path):
+    return sorted(Path(model_dir).glob("*.xml"))
 
-# ─────────── trajectory 快照（用于绘图） ───────────
-def snapshot_trajectories(env: int, bs: int):
-    Path(TRAJ_DIR).mkdir(exist_ok=True)
-    for prefix in ("biomass", "metabolites", "metabolites_delta"):
-        src = Path(TRAJ_DIR) / f"{prefix}_env{env}.csv"
-        dst = Path(TRAJ_DIR) / f"{prefix}_env{env}_bs{bs}.csv"
-        if src.exists():
-            shutil.copy(src, dst)
+# ─────────── Beam Search ───────────
+def beam_search_groups(partner_paths: list[Path],
+                       target_model: cobra.Model,
+                       env_names: list[str],
+                       env_state: dict[str, float],
+                       *,
+                       chunk: int,
+                       beam_width: int) -> list[list[Path]]:
+    """
+    返回若干满员伙伴列表（长度 = chunk）。
+    **仅用目标模型** 估算 μ_now，避免一次性加载所有伙伴模型。
+    """
+    mu_base, _ = get_growth(target_model, env_names, env_state)
+    mu_base = mu_base if mu_base > 0 else EPS_BASE  # 防止除以 0
 
-# ─────────── 汇总伙伴出现频率 ───────────
-def collect_frequency():
-    partner, all_models = {}, set()
-    for bs in range(2, 6):
-        fp = Path(f"results_bs{bs}") / "dfba_final_biomass.csv"
-        if not fp.exists():
-            continue
-        df = pd.read_csv(fp)
-        all_models |= {m for m in df["model_name"].unique() if m != TARGET_MODEL}
-        partner[bs] = {}
-        for env, rows in df[df.model_name == TARGET_MODEL].groupby("env_id"):
-            # factor 优先，其次 final_biomass
-            if "factor" in rows.columns and rows["factor"].notna().any():
-                gid = int(rows.loc[rows["factor"].idxmax(), "group_id"])
-            else:
-                gid = int(rows.loc[rows["final_biomass"].idxmax(), "group_id"])
-            plist = df[(df.env_id == env) &
-                       (df.group_id == gid) &
-                       (df.model_name != TARGET_MODEL)]["model_name"].tolist()
-            partner[bs][env] = plist
+    def fast_score(_sel):
+        try:
+            mu_now, _ = get_growth(target_model, env_names, env_state)
+        except Exception:
+            mu_now = 0.0
+        return (mu_now or 0.0) / mu_base
 
-    if not partner:
-        print("❌ No data to summarize; skipped partner_frequency.csv")
-        return
+    beam: list[tuple[list[Path], set[Path]]] = [([], set())]
+    for _ in range(chunk):
+        pool: list[tuple[list[Path], set[Path], float]] = []
+        for sel, used in beam:
+            for p in partner_paths:
+                if p in used:
+                    continue
+                new_sel = sel + [p]
+                new_used = used | {p}
+                pool.append((new_sel, new_used, fast_score(new_sel)))
+        pool.sort(key=lambda x: x[2], reverse=True)
+        beam = [(l, u) for l, u, _ in pool[:beam_width]]
 
-    env_ids = sorted({e for d in partner.values() for e in d})
-    cols    = sorted(all_models)
-    freq = pd.DataFrame(0.0, index=env_ids, columns=cols)
-    for env_map in partner.values():
-        for env, plist in env_map.items():
-            for m in plist:
-                freq.at[env, m] += 1
-    freq /= len(partner)   # 归一化到 0-1
-    freq.to_csv("partner_frequency.csv")
-    print("✅ partner_frequency.csv generated")
+    return [l for l, _ in beam]
 
-# ─────────── 绘制 2×2 子图 ───────────
-def plot_env_biomass_subplots(env_ids):
-    Path(PLOT_DIR).mkdir(exist_ok=True)
-    pos = {2: (0, 0), 3: (0, 1), 4: (1, 0), 5: (1, 1)}
+# ─────────── 主运行函数 ───────────
+def run_single_env(env_id: int,
+                   batch_size: int,
+                   *,
+                   show_plots=False):
+    envs = list(load_environment_ball(ENV_FILE))
+    if not (0 <= env_id < len(envs)):
+        raise ValueError(f"env_id {env_id} out of range (0–{len(envs)-1})")
 
-    for eid in env_ids:
-        fig, axes = plt.subplots(2, 2, figsize=(10, 8), sharex=True, sharey=True)
-        drawn = False
+    target_path: Path | None = None
+    partner_paths: list[Path] = []
+    for p in iter_model_paths(MODEL_DIR):
+        (target_path := p) if p.name == TARGET_FILE else partner_paths.append(p)
 
-        for bs in (2, 3, 4, 5):
-            fn = Path(TRAJ_DIR) / f"biomass_env{eid}_bs{bs}.csv"
-            if not fn.exists():
-                continue
+    if target_path is None:
+        raise FileNotFoundError(f"Target model {TARGET_FILE} not found")
+    if batch_size < 2:
+        raise ValueError("batch_size must be ≥2")
 
-            df = pd.read_csv(fn)
-            if "time" not in df.columns or TARGET_MODEL not in df.columns:
-                continue      # 非法 / 空文件
+    env        = envs[env_id]
+    env_names  = list(env)
+    chunk_size = batch_size - 1
+    if len(partner_paths) < chunk_size:
+        raise RuntimeError("Not enough partner models to form a full group.")
 
-            t  = df["time"]
-            ax = axes[pos[bs]]
+    Path(TRAJ_DIR).mkdir(exist_ok=True)          # ← 新增
+    traj = {}                                    # ← 新增：收集轨迹
 
-            base_col = f"{TARGET_MODEL}_baseline"
-            if base_col in df.columns and df[base_col].max() > 1e-10:
-                ax.plot(t, df[base_col], lw=2, ls="--", label="baseline")
+    # baseline
+    solo_model = cobra.io.read_sbml_model(target_path)
+    base_sol   = simulate([solo_model], env_names, env)
+    base_bio   = base_sol.y[0, -1] or EPS_BASE
+    print(f"[Baseline] target alone biomass = {base_bio:.6f}")
 
-            # target
-            ax.plot(t, df[TARGET_MODEL], lw=1.8, label="target")
+    # baseline 轨迹
+    traj["time"] = base_sol.t                   # ← 新增
+    traj[f"{TARGET_FILE}_baseline"] = base_sol.y[0]   # ← 新增
 
-            # partners（过滤掉全零列）
-            partners = [c for c in df.columns
-                        if c not in ("time", base_col, TARGET_MODEL)
-                        and df[c].max() > 1e-10]
+    # Beam Search
+    groups = beam_search_groups(partner_paths, solo_model,
+                                env_names, env,
+                                chunk=chunk_size, beam_width=BEAM_WIDTH)
+    print(f"Beam Search generated {len(groups)} candidate groups")
 
-            style_cycle = itertools.cycle(["-", "-.", ":", (0, (3, 1, 1, 1))])
-            for p in partners:
-                ax.plot(t, df[p], lw=1, ls=next(style_cycle), alpha=0.9, label=p)
+    records = []
+    best_bio = -np.inf
+    best_factor = -np.inf
+    best_partners: list[str] = []
 
-            ax.set_title(f"bs={bs}", fontsize=9)
-            ax.set_xticks([]); ax.set_yticks([])
-            drawn = True
+    for g_idx, group_other in enumerate(groups):
+        batch_paths = [target_path] + group_other
+        print(f"-- Group {g_idx}: {[p.name for p in batch_paths]}")
 
-        if not drawn:                 # 没有任何数据
-            plt.close(fig)
-            continue
+        models = [cobra.io.read_sbml_model(p) for p in batch_paths]
+        sol = simulate(models, env_names, env, show_plots=show_plots)
 
-        # —— 合并图例到顶部 ——
-        uniq = {}
-        for ax in axes.flat:
-            for h, l in zip(*ax.get_legend_handles_labels()):
-                # 保留第一个出现的 label
-                uniq.setdefault(l, h)
+        # —— 保存轨迹 ——（新增）
+        for i, p in enumerate(batch_paths):
+            traj[p.name] = sol.y[i]
 
-        handles, labels = list(uniq.values()), list(uniq.keys())
-        ncol = ceil(len(labels)/3) if len(labels) > 6 else len(labels)
-        fig.legend(handles, labels,
-                   loc="upper center",
-                   bbox_to_anchor=(0.5, 1.04),
-                   ncol=ncol,
-                   fontsize=6,
-                   frameon=False)
+        for i, p in enumerate(batch_paths):
+            final_bio = sol.y[i, -1]
+            is_target = p.name == TARGET_FILE
+            factor = final_bio / base_bio if is_target else np.nan
+            print(f" {p.name:<42} "
+                  f"final biomass = {final_bio:>8.4f}"
+                  f"{' | factor = %.4f' % factor if is_target else ''}")
 
-        fig.suptitle(f"Environment {eid}", fontsize=12, y=0.995)
-        plt.tight_layout(rect=[0, 0, 1, 0.94])   # 预留顶部给图例
-        outp = Path(PLOT_DIR) / f"biomass_env{eid}.png"
-        plt.savefig(outp, dpi=300)
-        plt.close(fig)
-        print(f"✅ {outp.name}")
+            records.append(dict(
+                env_id            = env_id,
+                group_id          = g_idx,
+                model_name        = p.name,
+                final_biomass     = final_bio,
+                factor            = factor,
+                baseline_biomass  = base_bio if is_target else np.nan
+            ))
 
-# ─────────── 主流程 ───────────
+            if is_target and factor > best_factor:
+                best_factor  = factor
+                best_bio     = final_bio
+                best_partners = [q.name for q in batch_paths
+                                 if q.name != TARGET_FILE]
+
+        del models
+        gc.collect()
+
+    print(f"** Env {env_id}: best target biomass = {best_bio:.4f} | "
+          f"best factor = {best_factor:.4f} partners = {best_partners}")
+
+    # 写结果 CSV
+    df = pd.DataFrame(records)
+    df["best_target_biomass"] = best_bio
+    df["best_target_factor"]  = best_factor
+    df["best_partner_names"]  = ";".join(best_partners)
+
+    cols = ["env_id", "group_id", "model_name",
+            "final_biomass", "factor", "baseline_biomass",
+            "best_target_biomass", "best_target_factor", "best_partner_names"]
+
+    Path(RESULT_DIR).mkdir(exist_ok=True)
+    out_file = Path(RESULT_DIR) / f"dfba_final_biomass_env{env_id}_bs{batch_size}.csv"
+    df[cols].to_csv(out_file, index=False)
+
+    # —— 写/合并轨迹 CSV ——（新增）
+    traj_df = pd.DataFrame(traj)
+    traj_path = Path(TRAJ_DIR) / f"biomass_env{env_id}.csv"
+    if traj_path.exists():
+        old = pd.read_csv(traj_path)
+        # 合并：以 time 为索引，更新新列或覆盖旧列
+        merged = old.set_index("time").combine_first(
+            traj_df.set_index("time")).reset_index()
+        merged.to_csv(traj_path, index=False)
+    else:
+        traj_df.to_csv(traj_path, index=False)
+
+# ─────────── CLI ───────────
 def main():
-    ap = argparse.ArgumentParser("Chunk-wise parallel driver for dFBA")
-    ap.add_argument("--start_env", type=int, default=0)
-    ap.add_argument("--stop_env",  type=int, required=True)
-    ap.add_argument("--chunk",     type=int, default=15,
-                    help="并行批大小（按 env 划分）")
-    ap.add_argument("--timeout",   type=int, default=600,
-                    help="子进程超时（秒）")
-    ap.add_argument("--plot", action="store_true",
-                    help="运行结束后绘制 2×2 子图")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(
+        description="Group-dynamic dFBA runner (single-env mode friendly)"
+    )
+    parser.add_argument("--env", type=int,
+                        help="single environment id to simulate")
+    parser.add_argument("--env_start", type=int,
+                        help="first env_id (inclusive)")
+    parser.add_argument("--env_stop", type=int,
+                        help="last env_id (inclusive)")
+    parser.add_argument("--batch_size", "--bs", type=int, dest="batch_size",
+                        default=3, help="group size including target (default 3)")
+    parser.add_argument("--plot", action="store_true",
+                        help="show biomass & metabolite plots")
+    args = parser.parse_args()
 
-    env_ids = list(range(args.start_env, args.stop_env + 1))
+    try:
+        if args.env is None and (args.env_start is None or args.env_stop is None):
+            parser.error("Either --env or both --env_start/--env_stop must be specified")
 
-    # —— 清理旧快照 ——
-    if Path(TRAJ_DIR).exists():
-        for old in Path(TRAJ_DIR).glob("*_bs*.csv"):
-            old.unlink()
+        if args.env is not None:
+            run_single_env(args.env, args.batch_size, show_plots=args.plot)
+        else:
+            for eid in range(args.env_start, args.env_stop + 1):
+                run_single_env(eid, args.batch_size, show_plots=args.plot)
 
-    # —— 清理旧汇总 ——
-    for bs in range(2, 6):
-        fp = Path(f"results_bs{bs}") / "dfba_final_biomass.csv"
-        if fp.exists():
-            fp.unlink()
-
-    # —— 分段并行调度 ——
-    for i in range(0, len(env_ids), args.chunk):
-        batch_envs = env_ids[i : i + args.chunk]
-        print(f"\n>>> Processing environments {batch_envs[0]}–{batch_envs[-1]}")
-
-        # 启动子进程
-        procs = {env: [] for env in batch_envs}
-        for env in batch_envs:
-            for bs in range(2, 6):
-                p = subprocess.Popen(
-                    [sys.executable, "dFBA.py", "--env", str(env), "--bs", str(bs)],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE
-                )
-                procs[env].append((bs, p))
-
-        # 收集结果
-        for env in batch_envs:
-            for bs, p in procs[env]:
-                try:
-                    out, err = p.communicate(timeout=args.timeout)
-                except subprocess.TimeoutExpired:
-                    print(f"⏰ Timeout: env {env}, bs {bs} — killed")
-                    p.kill()
-                    out, err = p.communicate()
-                    create_placeholder(env, bs)
-                except Exception:
-                    print(f"‼️ Error: env {env}, bs {bs}\n{traceback.format_exc()}")
-                    create_placeholder(env, bs)
-                else:
-                    if p.returncode != 0:
-                        print(f"⚠️  Subprocess exited non-zero (env {env}, bs {bs})")
-                        create_placeholder(env, bs)
-                finally:
-                    # 打印子进程输出
-                    if out:
-                        sys.stdout.write(out.decode(errors="ignore"))
-                    if err:
-                        sys.stderr.write(err.decode(errors="ignore"))
-
-                    # 合并结果 & 快照
-                    merge_one(env, bs)
-                    snapshot_trajectories(env, bs)
-                    gc.collect()
-
-    # —— 汇总出现频率 ——
-    collect_frequency()
-
-    # —— 绘图（可选） ——
-    if args.plot:
-        plot_env_biomass_subplots(env_ids)
+    except Exception:
+        traceback.print_exc()
+        sys.exit(1)
+    finally:
+        gc.collect()
 
 if __name__ == "__main__":
     main()
