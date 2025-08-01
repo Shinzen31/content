@@ -33,7 +33,7 @@ EXTINCT_EPS    = 1e-8             # ←★ 新增：灭绝阈值，低于该值�
 MONOD_CONSTANT = 10
 YIELD_FACTOR   = 0.1              # 仅对分泌 (v>0) 缩放
 WATER_CONSTANT = 10               # EX_cpd00001_e0 下限
-BEAM_WIDTH     = 5
+BEAM_WIDTH     = 10
 
 cobra.Configuration().solver = "glpk"
 
