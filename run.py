@@ -19,7 +19,7 @@ TRAJ_DIR     = "trajectories"
 PLOT_DIR     = "plots"
 TARGET_MODEL = "GCF_000010425.1_ASM1042v1_protein_gapfilled_noO2_appliedMedium.xml"
 
-# ─────────── 合并单 env-bs 结果 ───────────
+# ─────────── 合并单 env-bs 最终 biomass 结果 ───────────
 def merge_one(env: int, bs: int):
     src = Path(RESULTS_DIR) / f"dfba_final_biomass_env{env}_bs{bs}.csv"
     if not src.exists():
@@ -35,6 +35,24 @@ def merge_one(env: int, bs: int):
     else:
         df = df_new
     df.sort_values(["env_id", "group_id", "model_name"]).to_csv(dst, index=False)
+
+# ─────────── 合并单 env-bs top-Δ 结果 ───────────
+def merge_topdelta(env: int, bs: int):
+    src = Path(RESULTS_DIR) / f"topdelta_env{env}_bs{bs}.csv"
+    if not src.exists():
+        return
+    dst_dir = Path(f"results_bs{bs}"); dst_dir.mkdir(exist_ok=True)
+    dst = dst_dir / "topdelta.csv"
+    df_new = pd.read_csv(src)
+    if dst.exists():
+        df = pd.read_csv(dst)
+        df = pd.concat([df, df_new], ignore_index=True)
+        df = df.drop_duplicates(
+            subset=["env_id", "group_id", "metabolite_id"], keep="last"
+        )
+    else:
+        df = df_new
+    df.sort_values(["env_id", "group_id", "metabolite_id"]).to_csv(dst, index=False)
 
 # ─────────── 占位文件 ───────────
 def create_placeholder(env: int, bs: int):
@@ -101,7 +119,7 @@ def plot_env_biomass_subplots(env_ids):
             continue
         df_r = pd.read_csv(fp)
         for eid in env_ids:
-            rows = df_r[(df_r.env_id == eid) and (df_r.model_name == TARGET_MODEL)]
+            rows = df_r[(df_r.env_id == eid) & (df_r.model_name == TARGET_MODEL)]
             if rows.empty:
                 continue
             row = rows.loc[
@@ -115,7 +133,6 @@ def plot_env_biomass_subplots(env_ids):
 
     for eid in env_ids:
         fig, axes = plt.subplots(2, 2, figsize=(10, 8), sharex=True, sharey=True)
-        # 增加上下子图间距
         fig.subplots_adjust(hspace=0.6, wspace=0.35)
         drawn = False
 
@@ -146,7 +163,6 @@ def plot_env_biomass_subplots(env_ids):
             ax.set_title(f"bs={bs}", fontsize=9)
             ax.tick_params(labelsize=7)
 
-            # —— legend 垂直排列 ——
             hdl, lbl = ax.get_legend_handles_labels()
             if hdl:
                 ax.legend(
@@ -186,9 +202,12 @@ def main():
         for f in Path(TRAJ_DIR).glob("*_bs*.csv"):
             f.unlink()
     for bs in range(2, 6):
-        fp = Path(f"results_bs{bs}") / "dfba_final_biomass.csv"
-        if fp.exists():
-            fp.unlink()
+        fp1 = Path(f"results_bs{bs}") / "dfba_final_biomass.csv"
+        fp2 = Path(f"results_bs{bs}") / "topdelta.csv"
+        if fp1.exists():
+            fp1.unlink()
+        if fp2.exists():
+            fp2.unlink()
 
     # 分段并行
     for i in range(0, len(env_ids), args.chunk):
@@ -224,6 +243,7 @@ def main():
                     if err:
                         sys.stderr.write(err.decode(errors="ignore"))
                     merge_one(env, bs)
+                    merge_topdelta(env, bs)   # ← 新增
                     snapshot_trajectories(env, bs)
                     gc.collect()
 
