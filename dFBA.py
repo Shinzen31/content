@@ -122,6 +122,7 @@ def simulate(models_orig: list[cobra.Model],
         plt.legend(); plt.tight_layout(); plt.show()
 
         plt.figure(figsize=(6,4))
+            # caret
         for j,rid in enumerate(env_names):
             plt.plot(sol.t, sol.y[n_models+j], label=rid)
         plt.xlabel("Time (h)"); plt.ylabel("Concentration")
@@ -190,6 +191,7 @@ def run_single_env(env_id: int, batch_size: int, *, show_plots=False):
         raise RuntimeError("Not enough partner models to form a full group.")
 
     Path(TRAJ_DIR).mkdir(exist_ok=True)
+    Path(RESULT_DIR).mkdir(exist_ok=True)
     traj = {}
 
     # baseline
@@ -210,6 +212,9 @@ def run_single_env(env_id: int, batch_size: int, *, show_plots=False):
     records, best_bio, best_factor = [], -np.inf, -np.inf
     best_partners: list[str] = []
 
+    # —— 新增：delta 记录表 —— #
+    top_delta_records: list[dict[str, object]] = []
+
     for g_idx, group_other in enumerate(groups):
         batch_paths = [target_path] + group_other
         print(f"-- Group {g_idx}: {[p.name for p in batch_paths]}")
@@ -217,9 +222,35 @@ def run_single_env(env_id: int, batch_size: int, *, show_plots=False):
         models = [cobra.io.read_sbml_model(p) for p in batch_paths]
         sol = simulate(models, env_names, env, show_plots=show_plots)
 
+        # ① 记录 biomass 轨迹（原逻辑）
         for i, p in enumerate(batch_paths):
             traj[p.name] = sol.y[i]
 
+        # ② 记录 metabolite 轨迹 & delta
+        n_models_grp = len(models)
+        mets_block   = sol.y[n_models_grp:, :]                # shape (n_mets, n_t)
+        df_mets = pd.DataFrame(mets_block.T, columns=env_names)
+        df_mets.insert(0, "time", sol.t)
+        df_mets.to_csv(Path(TRAJ_DIR) /
+            f"metabolites_env{env_id}.csv", index=False)
+
+        df_delta = df_mets.copy()
+        df_delta[env_names] = df_delta[env_names].diff().fillna(0.0)
+        df_delta.to_csv(Path(TRAJ_DIR) /
+            f"metabolites_delta_env{env_id}.csv", index=False)
+
+        # ③ 根据 net Δ（最终–初始）挑选 Top-10
+        net_delta = df_mets.iloc[-1][env_names] - df_mets.iloc[0][env_names]
+        top10     = net_delta.abs().nlargest(10)
+        for met_id in top10.index:
+            top_delta_records.append(dict(
+                env_id        = env_id,
+                group_id      = g_idx,
+                metabolite_id = met_id,
+                delta         = net_delta[met_id]   # 保留正负号
+            ))
+
+        # —— 后续原有统计 —— #
         for i, p in enumerate(batch_paths):
             final_bio = sol.y[i, -1]
             is_target = p.name == TARGET_FILE
@@ -252,12 +283,30 @@ def run_single_env(env_id: int, batch_size: int, *, show_plots=False):
     cols = ["env_id","group_id","model_name","final_biomass","factor",
             "baseline_biomass","best_target_biomass","best_target_factor",
             "best_partner_names"]
+    pd.DataFrame(traj).to_csv(Path(TRAJ_DIR) /
+        f"biomass_env{env_id}.csv", index=False)
+
     Path(RESULT_DIR).mkdir(exist_ok=True)
     df[cols].to_csv(Path(RESULT_DIR) /
         f"dfba_final_biomass_env{env_id}_bs{batch_size}.csv", index=False)
 
-    pd.DataFrame(traj).to_csv(Path(TRAJ_DIR) /
-        f"biomass_env{env_id}.csv", index=False)
+    # —— 写出 / 合并 top-Δ 结果 —— #
+    if top_delta_records:
+        topdelta_path = Path(RESULT_DIR) / f"topdelta_env{env_id}_bs{batch_size}.csv"
+        df_new = pd.DataFrame(top_delta_records)
+
+        if topdelta_path.exists():
+            df_old = pd.read_csv(topdelta_path)
+            df_combined = pd.concat([df_old, df_new], ignore_index=True)
+            df_combined = df_combined.drop_duplicates(
+                subset=["env_id", "group_id", "metabolite_id"], keep="last"
+            )
+        else:
+            df_combined = df_new
+
+        df_combined.sort_values(
+            ["env_id", "group_id", "metabolite_id"]
+        ).to_csv(topdelta_path, index=False)
 
 # ─────────── CLI ───────────
 def main():
