@@ -1,106 +1,121 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-predict_moe_profiling_free.py
+predict_hybrid.py
+=================
 
-Project goals covered:
-- Hybrid parallelism strategies (DP, TP, PP, MoE/EP): provides a profiling-free planner
-  that estimates DP/TP/PP/EP costs and outputs a plan; trains with DP (Horovod/PyTorch DDP)
-  and supports MoE (local or distributed experts).
-- Acceleration techniques aware of hardware + model: cost model takes FLOPs, activation sizes,
-  topology (nodes, accelerators/node, bandwidth/latency/memory/compute) to recommend a plan.
-- Reduce reliance on exhaustive profiling: no runtime traces required; uses analytical models.
-- Practical HPC skills used: Horovod+MPI, comm/compute overlap, pin-mem prefetch I/O, seeds,
-  environment threads (MKL/OMP), optional DDP fallback, SGE-aware reproducibility.
+This file demonstrates how to couple a **profiling-free parallelism planner** with an
+actual **hybrid parallel training framework** that combines:
 
-This module expects *in-silico* training labels from GSMM simulations:
-- N_env environments with feature vectors X (CSV)
-- For each environment and k in {2,3,4,5}, a multi-hot 40-dim label vector y_{k}
-  indicating the best species set (including a required target species).
+- Data Parallelism (DP)
+- Tensor Parallelism (TP)
+- Pipeline Parallelism (PP)
+- Expert Parallelism (EP, for Mixture-of-Experts models)
 
-If files are missing, synthetic examples will be generated so the pipeline runs end-to-end.
+The project goal is to show how to:
+1. Start from **hardware + model specs**
+2. Use a **profiling-free planner** to decide (dp, tp, pp, ep)
+3. Build corresponding **process groups**
+4. Later (in other sections), actually use these groups in model layers and training loop.
+
+This first part implements:
+- Profiling-free planner (HybridPlanner)
+- Communication group manager (ProcessGroupManager)
+
+The code is heavily commented so it can be used in a PhD defense to show both
+engineering and scientific reasoning.
 """
 
 import os
 import math
 import json
-import time
-import random
 import warnings
 from dataclasses import dataclass, asdict
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Dict, List, Tuple
 
-import numpy as np
+import torch
+import torch.distributed as dist
 
-# Set thread env for MKL/OMP to avoid oversubscription; can be tuned on clusters.
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
 
-try:
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-    from torch.utils.data import Dataset, DataLoader
-    TORCH_AVAILABLE = True
-except Exception as e:
-    TORCH_AVAILABLE = False
-    raise
-
-# Optional Horovod for DP; if absent, we gracefully fall back.
-try:
-    import horovod.torch as hvd
-    HOROVOD = True
-except Exception:
-    HOROVOD = False
-
-# -----------------------------
-# Reproducibility & Seeding
-# -----------------------------
-
-def seed_everything(seed: Optional[int] = None) -> int:
-    """Deterministic seeding; if on SGE, derive from task id for reproducibility."""
-    if seed is None:
-        seed = 42
-        sge_task_id = os.environ.get("SGE_TASK_ID")
-        if sge_task_id is not None:
-            try:
-                seed = (int(sge_task_id) % 10_000_000) + 42
-            except ValueError:
-                pass
-    random.seed(seed)
-    np.random.seed(seed)
-    if TORCH_AVAILABLE:
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        torch.use_deterministic_algorithms(False)
-    return seed
-
-# -----------------------------
-# Hardware & Model Specs
-# -----------------------------
+# ============================================================
+# Section 1: Hardware and Model Specifications
+# ============================================================
 
 @dataclass
 class HardwareSpec:
+    """
+    Describe the hardware resources available.
+
+    Attributes
+    ----------
+    num_nodes : int
+        Number of compute nodes in the cluster.
+    acc_per_node : int
+        Number of accelerators (e.g. GPUs) per node.
+    peak_tflops : float
+        Peak compute power per accelerator (TFLOPS).
+    mem_gb : float
+        Memory capacity per accelerator (GB).
+    net_bandwidth_gbps : float
+        Effective bandwidth of interconnect (Gbps).
+    net_latency_us : float
+        Network latency (microseconds).
+    topo : str
+        Topology type (e.g. "fat-tree", "mesh").
+    """
     num_nodes: int = 1
     acc_per_node: int = 1
-    peak_tflops: float = 20.0   # per accelerator (e.g., GPU) FP16 TFLOPS
-    mem_gb: float = 16.0        # per accelerator memory
-    net_bandwidth_gbps: float = 100.0  # per link effective bandwidth
+    peak_tflops: float = 20.0
+    mem_gb: float = 16.0
+    net_bandwidth_gbps: float = 100.0
     net_latency_us: float = 2.0
-    topo: str = "fat-tree"      # or "mesh", "torus", hint for collectives
+    topo: str = "fat-tree"
+
 
 @dataclass
 class ModelSpec:
-    params_billion: float = 0.05  # model size in billions of params (example ~50M)
-    act_mb_per_sample: float = 10.0  # activation footprint per sample (MB) rough
-    flops_per_sample_giga: float = 50.0  # forward FLOPs per sample (GFLOPs)
+    """
+    Describe the model requirements.
+
+    Attributes
+    ----------
+    params_billion : float
+        Number of parameters in billions.
+    act_mb_per_sample : float
+        Activation footprint per sample in MB.
+    flops_per_sample_giga : float
+        Computation required per sample in GFLOPs.
+    seq_len : int
+        Sequence length (useful for Transformers).
+    experts : int
+        Number of experts in MoE.
+    topk : int
+        Number of experts selected by the router.
+    """
+    params_billion: float = 0.05
+    act_mb_per_sample: float = 10.0
+    flops_per_sample_giga: float = 50.0
     seq_len: int = 128
     experts: int = 8
-    topk: int = 2  # MoE top-k routing
+    topk: int = 2
+
 
 @dataclass
 class Plan:
+    """
+    Output of the profiling-free planner.
+
+    Attributes
+    ----------
+    dp, tp, pp, ep : int
+        Degrees of Data, Tensor, Pipeline, and Expert parallelism.
+    global_batch : int
+        Total global batch size.
+    micro_batch : int
+        Micro-batch size (important for pipeline parallelism).
+    notes : str
+        Explanatory notes or warnings.
+    """
     dp: int
     tp: int
     pp: int
@@ -109,448 +124,706 @@ class Plan:
     micro_batch: int
     notes: str
 
-# -----------------------------
-# Profiling-free cost model
-# -----------------------------
+
+# ============================================================
+# Section 2: Profiling-Free Planner
+# ============================================================
 
 class HybridPlanner:
     """
-    A lightweight analytical cost model that estimates per-iteration time
-    for combinations of DP/TP/PP/EP without running the model.
+    Profiling-free planner that decides (dp, tp, pp, ep) configuration.
+
+    Unlike empirical tuning (profiling multiple runs), this planner relies
+    on *analytical cost models* to predict which combination will minimize
+    iteration time while respecting memory limits.
+
+    This is important in PhD defense context:
+    - Shows you can reason analytically about scaling laws
+    - Reduces ecological and economic cost of trial-and-error profiling
     """
+
     def __init__(self, hw: HardwareSpec, ms: ModelSpec):
         self.hw = hw
         self.ms = ms
         self.world = hw.num_nodes * hw.acc_per_node
 
-    def _compute_throughput_time(self, flops_total: float, dp_degree: int, eff: float = 0.35) -> float:
+    # ----------------------------
+    # Compute model
+    # ----------------------------
+    def _compute_time(self, flops_total: float, eff: float = 0.35) -> float:
         """
-        Compute time for compute assuming aggregate peak * efficiency.
+        Estimate computation time for given FLOPs.
+
+        eff : float
+            Efficiency (30-40% typical in large-scale training).
         """
-        peak_tflops_total = self.hw.peak_tflops * self.world
-        # Scale with DP (simplified): each replica handles 1/dp of batch
-        peak = peak_tflops_total * eff
-        # seconds = FLOPs (in TFLOPs) / (peak TFLOPs/s)
+        peak = self.hw.peak_tflops * self.world * eff
         return flops_total / max(1e-6, peak)
 
+    # ----------------------------
+    # Communication models
+    # ----------------------------
     def _allreduce_time(self, tensor_mb: float, p: int) -> float:
         """
-        Estimate allreduce time using a log(p) model (ring/tree hybrid).
+        Approximate allreduce time with log(p) steps.
         """
-        B = self.hw.net_bandwidth_gbps  # Gbps
+        B = self.hw.net_bandwidth_gbps
         L = self.hw.net_latency_us * 1e-6
-        # Convert MB to Mb (megabits): 1 MB = 8 Mb
         size_Mb = tensor_mb * 8.0
-        # Effective steps ~ log2(p); per step time: L + size/B
         steps = max(1.0, math.log2(max(1, p)))
-        return steps * (L + size_Mb / (B * 1e3))  # B in Gbps => *1e3 to convert to Mb/s
+        return steps * (L + size_Mb / (B * 1e3))
 
     def _pp_bubble_overhead(self, stages: int, micro_batches: int) -> float:
         """
-        Simple pipeline bubble fraction model: (stages - 1) / micro_batches.
+        Pipeline bubble fraction.
         """
         return max(0.0, (stages - 1) / max(1, micro_batches))
 
-    def _memory_ok(self, dp:int, tp:int, pp:int, ep:int, micro_batch:int) -> bool:
-        """
-        Very rough memory feasibility check: params shard by tp & ep; activation by pp; batch by dp.
-        """
-        params_total_gb = self.ms.params_billion * 2.0  # assume 2 bytes/param (FP16) per param (GB approx)
-        params_per_rank_gb = params_total_gb / max(1, tp*ep)
-        acts_per_rank_gb = (self.ms.act_mb_per_sample * micro_batch / max(1, pp)) / 1024.0
-        optimizer_states_gb = params_per_rank_gb * 2.0  # momenta etc.
-        needed = params_per_rank_gb + acts_per_rank_gb + optimizer_states_gb + 2.0  # + fragmentation headroom
+    # ----------------------------
+    # Memory feasibility
+    # ----------------------------
+    def _memory_ok(self, tp: int, pp: int, ep: int, micro_batch: int) -> bool:
+        params_total_gb = self.ms.params_billion * 2.0
+        params_per_rank = params_total_gb / max(1, tp*ep)
+        acts_per_rank = (self.ms.act_mb_per_sample * micro_batch / max(1, pp)) / 1024.0
+        optimizer_states = params_per_rank * 2.0
+        needed = params_per_rank + acts_per_rank + optimizer_states + 2.0
         return needed <= self.hw.mem_gb
 
-    def plan(self, global_batch:int=64, target_micro:int=4) -> Plan:
-        """
-        Search over small grids of (tp, pp, ep) consistent with world size and choose dp accordingly.
-        """
+    # ----------------------------
+    # Main planning function
+    # ----------------------------
+    def plan(self, global_batch: int = 64, target_micro: int = 4) -> Plan:
         best = None
         notes = []
         for tp in [1, 2, 4]:
             for pp in [1, 2, 4]:
                 for ep in [1, 2, 4]:
-                    if tp*pp*ep > self.world: 
+                    if tp * pp * ep > self.world:
                         continue
                     dp = max(1, self.world // (tp*pp*ep))
-                    micro_batch = target_micro
-                    # Memory feasibility
-                    if not self._memory_ok(dp, tp, pp, ep, micro_batch):
+                    if not self._memory_ok(tp, pp, ep, target_micro):
                         continue
-                    # Compute cost (very rough): FLOPs per sample * global_batch / (dp*pp) (PP reduces per-stage)
-                    flops_total_t = (self.ms.flops_per_sample_giga * 1e-3) * (global_batch / max(1, dp))
-                    t_compute = self._compute_throughput_time(flops_total_t, dp)
-                    # Comm costs:
-                    # - DP: gradient allreduce ~ params size / dp
-                    grad_mb = self.ms.params_billion * 1000.0 * 2.0 / max(1, tp*ep)  # 2 bytes/param -> MB approx
+                    flops_total_t = (self.ms.flops_per_sample_giga * 1e-3) * (global_batch / dp)
+                    t_comp = self._compute_time(flops_total_t)
+                    grad_mb = self.ms.params_billion * 1000.0 * 2.0 / max(1, tp*ep)
                     t_dp = self._allreduce_time(grad_mb, dp) if dp > 1 else 0.0
-                    # - TP: tensor shards require all-gather per layer ~ scale w/ tp
-                    t_tp = 0.001 * (tp - 1)  # placeholder small penalty
-                    # - EP: MoE all-to-all dispatch/permute cost ~ scale w/ topk and ep
+                    t_tp = 0.001 * (tp - 1)
                     t_ep = 0.001 * self.ms.topk * (ep - 1)
-                    # - PP bubble:
-                    bubble = self._pp_bubble_overhead(pp, micro_batch)
-                    t_total = (t_compute * (1.0 + bubble)) + t_dp + t_tp + t_ep
+                    bubble = self._pp_bubble_overhead(pp, target_micro)
+                    t_total = (t_comp * (1.0 + bubble)) + t_dp + t_tp + t_ep
                     score = t_total
                     if (best is None) or (score < best[0]):
-                        best = (score, dp, tp, pp, ep, micro_batch)
+                        best = (score, dp, tp, pp, ep, target_micro)
         if best is None:
-            # Fallback single-device plan
             best = (0.0, 1, 1, 1, 1, target_micro)
             notes.append("Memory constraints forced single-rank plan.")
         _, dp, tp, pp, ep, micro = best
         if dp*tp*pp*ep != self.world:
-            notes.append(f"World size {self.world} not fully utilized by dp={dp},tp={tp},pp={pp},ep={ep}.")
-        return Plan(dp=dp, tp=tp, pp=pp, ep=ep, global_batch=global_batch, micro_batch=micro,
-                    notes=" | ".join(notes))
+            notes.append(f"World size {self.world} not fully used.")
+        return Plan(dp=dp, tp=tp, pp=pp, ep=ep, global_batch=global_batch,
+                    micro_batch=micro, notes=" | ".join(notes))
 
-# -----------------------------
-# Dataset
-# -----------------------------
 
-class BestGroupDataset(Dataset):
+# ============================================================
+# Section 3: Process Group Manager
+# ============================================================
+
+class ProcessGroupManager:
     """
-    Expects CSV files:
-    - env_features.csv: columns: env_id,int; feat_0..feat_F-1 floats
-    - labels.csv: columns: env_id,int; k,int; target_id,int; label_multi_hot,json list of 40 ints; biomass,float
-    If files do not exist, synthetic data are generated.
+    Manage distributed communication groups according to planner output.
+
+    Why is this necessary?
+    ----------------------
+    - In DP/TP/PP/EP, each dimension requires its own set of process groups.
+    - E.g. for DP, we allreduce gradients among replicas.
+    - For TP, we allgather/reduce-scatter within a tensor parallel group.
+    - For PP, we send/recv between pipeline stages.
+    - For EP, we all-to-all across expert shards.
+
+    This class creates and stores the necessary subgroups.
     """
-    def __init__(self, root:str, F:int=32, species:int=40, ks=(2,3,4,5), split:str="train", seed:int=42):
-        self.root = root
-        self.F, self.species = F, species
-        self.ks = ks
-        self.split = split
-        rng = np.random.default_rng(seed)
-        env_path = os.path.join(root, "env_features.csv")
-        lab_path = os.path.join(root, "labels.csv")
-        if not os.path.exists(env_path) or not os.path.exists(lab_path):
-            warnings.warn("Input CSVs not found. Generating synthetic dataset for demo.")
-            N = 5000 if split=="train" else 1000
-            self.X = rng.standard_normal((N, F)).astype(np.float32)
-            self.k = rng.choice(ks, size=N)
-            self.target = rng.integers(0, species, size=N)
-            self.labels = np.zeros((N, species), dtype=np.float32)
-            for i in range(N):
-                k = self.k[i]
-                tgt = self.target[i]
-                candidates = [tgt] + rng.choice([j for j in range(species) if j!=tgt], size=k-1, replace=False).tolist()
-                self.labels[i, candidates] = 1.0
-            self.biomass = rng.random(N).astype(np.float32)
+
+    def __init__(self, plan: Plan, world_size: int, rank: int):
+        self.plan = plan
+        self.world_size = world_size
+        self.rank = rank
+        self.dp_group = None
+        self.tp_group = None
+        self.pp_group = None
+        self.ep_group = None
+
+    def build_groups(self):
+        """
+        Build torch.distributed groups for DP, TP, PP, EP.
+
+        Note: In practice, we'd partition ranks carefully.
+        For simplicity, we assume ranks are ordered in a cartesian grid:
+        [dp][tp][pp][ep].
+        """
+        dp, tp, pp, ep = self.plan.dp, self.plan.tp, self.plan.pp, self.plan.ep
+
+        if not dist.is_initialized():
+            raise RuntimeError("torch.distributed not initialized")
+
+        # Simple grid mapping
+        grid = []
+        for d in range(dp):
+            for t in range(tp):
+                for p in range(pp):
+                    for e in range(ep):
+                        grid.append((d, t, p, e))
+        if len(grid) != self.world_size:
+            warnings.warn("Grid size mismatch with world_size")
+
+        # Helper to get subgroup ranks
+        def subgroup_ranks(dim: str, coord: Tuple[int,int,int,int]) -> List[int]:
+            ranks = []
+            for idx, (d, t, p, e) in enumerate(grid):
+                if dim == "dp" and (t,p,e) == (coord[1],coord[2],coord[3]):
+                    ranks.append(idx)
+                if dim == "tp" and (d,p,e) == (coord[0],coord[2],coord[3]):
+                    ranks.append(idx)
+                if dim == "pp" and (d,t,e) == (coord[0],coord[1],coord[3]):
+                    ranks.append(idx)
+                if dim == "ep" and (d,t,p) == (coord[0],coord[1],coord[2]):
+                    ranks.append(idx)
+            return ranks
+
+        # Current rank coordinates
+        coord = grid[self.rank]
+
+        self.dp_group = dist.new_group(ranks=subgroup_ranks("dp", coord))
+        self.tp_group = dist.new_group(ranks=subgroup_ranks("tp", coord))
+        self.pp_group = dist.new_group(ranks=subgroup_ranks("pp", coord))
+        self.ep_group = dist.new_group(ranks=subgroup_ranks("ep", coord))
+
+    def info(self) -> Dict[str, List[int]]:
+        """
+        Return info about group membership for this rank.
+        """
+        return {
+            "dp_group": dist.get_world_size(self.dp_group) if self.dp_group else 1,
+            "tp_group": dist.get_world_size(self.tp_group) if self.tp_group else 1,
+            "pp_group": dist.get_world_size(self.pp_group) if self.pp_group else 1,
+            "ep_group": dist.get_world_size(self.ep_group) if self.ep_group else 1,
+        }
+# ============================================================
+# Section 4: Tensor Parallelism (TP) Layers
+# ============================================================
+
+class ColumnParallelLinear(torch.nn.Module):
+    """
+    Linear layer where weight matrix is column-partitioned across tensor-parallel ranks.
+
+    Suppose weight W has shape [out_features, in_features].
+    - In standard Linear: y = x @ W^T + b
+    - In ColumnParallelLinear with tp>1:
+        * W is split by columns (out_features / tp per rank)
+        * Each rank computes partial output y_local
+        * Then allgather across TP group to assemble full y
+
+    Benefits
+    --------
+    - Reduces memory per rank (only store 1/tp of W)
+    - Enables scaling to very large hidden sizes
+    """
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True,
+                 process_group: Optional[dist.ProcessGroup] = None):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.pg = process_group if process_group is not None else dist.group.WORLD
+        self.tp_world_size = dist.get_world_size(self.pg)
+        self.tp_rank = dist.get_rank(self.pg)
+
+        assert out_features % self.tp_world_size == 0, "out_features must be divisible by tp size"
+        self.out_per_partition = out_features // self.tp_world_size
+
+        # Local shard of weight and bias
+        self.weight = torch.nn.Parameter(torch.empty(
+            self.out_per_partition, in_features))
+        torch.nn.init.xavier_uniform_(self.weight)
+
+        if bias:
+            self.bias = torch.nn.Parameter(torch.zeros(self.out_per_partition))
         else:
-            import pandas as pd
-            env = pd.read_csv(env_path)
-            lab = pd.read_csv(lab_path)
-            merged = lab.merge(env, on="env_id", how="inner")
-            feats = [c for c in merged.columns if c.startswith("feat_")]
-            self.X = merged[feats].values.astype(np.float32)
-            self.k = merged["k"].values.astype(np.int64)
-            self.target = merged["target_id"].values.astype(np.int64)
-            self.biomass = merged.get("biomass", pd.Series(np.zeros(len(merged)))).values.astype(np.float32)
-            # parse labels
-            import ast
-            tmp = np.zeros((len(merged), species), dtype=np.float32)
-            for i, s in enumerate(merged["label_multi_hot"].values):
-                arr = np.array(ast.literal_eval(s), dtype=np.int64)
-                tmp[i, arr] = 1.0
-            self.labels = tmp
+            self.bias = None
 
-    def __len__(self): return len(self.X)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Local matmul
+        y_local = torch.matmul(x, self.weight.t())
+        if self.bias is not None:
+            y_local = y_local + self.bias
+
+        # Allgather outputs across TP group
+        outputs = [torch.empty_like(y_local) for _ in range(self.tp_world_size)]
+        dist.all_gather(outputs, y_local, group=self.pg)
+
+        y_full = torch.cat(outputs, dim=-1)
+        return y_full
+
+
+class RowParallelLinear(torch.nn.Module):
+    """
+    Linear layer where weight matrix is row-partitioned across tensor-parallel ranks.
+
+    Suppose weight W has shape [out_features, in_features].
+    - In RowParallelLinear with tp>1:
+        * W is split by rows (in_features / tp per rank)
+        * Each rank multiplies with local shard of input
+        * Outputs are summed with allreduce
+
+    This complements ColumnParallelLinear to enable
+    full tensor-parallel Transformers.
+    """
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True,
+                 process_group: Optional[dist.ProcessGroup] = None):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.pg = process_group if process_group is not None else dist.group.WORLD
+        self.tp_world_size = dist.get_world_size(self.pg)
+        self.tp_rank = dist.get_rank(self.pg)
+
+        assert in_features % self.tp_world_size == 0, "in_features must be divisible by tp size"
+        self.in_per_partition = in_features // self.tp_world_size
+
+        # Local shard of weight
+        self.weight = torch.nn.Parameter(torch.empty(
+            out_features, self.in_per_partition))
+        torch.nn.init.xavier_uniform_(self.weight)
+
+        if bias and self.tp_rank == 0:
+            self.bias = torch.nn.Parameter(torch.zeros(out_features))
+        else:
+            self.bias = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Each rank uses its local input slice
+        x_local = x[:, :, self.tp_rank*self.in_per_partition:
+                       (self.tp_rank+1)*self.in_per_partition]
+        y_local = torch.matmul(x_local, self.weight.t())
+
+        # Sum partial outputs
+        dist.all_reduce(y_local, group=self.pg)
+
+        if self.bias is not None:
+            y_local = y_local + self.bias
+
+        return y_local
+
+
+# ============================================================
+# Section 5: Pipeline Parallelism (PP)
+# ============================================================
+
+class PipelineStage(torch.nn.Module):
+    """
+    Represent one stage of pipeline parallelism.
+
+    In PP, model is split across 'pp' stages.
+    Each stage handles a consecutive set of layers.
+    Micro-batches are passed sequentially through stages.
+
+    Communication pattern:
+    - Forward: send output to next stage
+    - Backward: send gradients to previous stage
+
+    Here we provide a simplified interface:
+    - forward(x, microbatch_id): compute local stage forward
+    - receive from prev stage if not first
+    - send to next stage if not last
+    """
+
+    def __init__(self, stage_id: int, num_stages: int,
+                 module: torch.nn.Module,
+                 process_group: Optional[dist.ProcessGroup] = None):
+        super().__init__()
+        self.stage_id = stage_id
+        self.num_stages = num_stages
+        self.module = module
+        self.pg = process_group if process_group is not None else dist.group.WORLD
+        self.rank = dist.get_rank(self.pg)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.module(x)
+
+    def send_forward(self, x: torch.Tensor, dst_rank: int):
+        """
+        Send activations to next stage.
+        """
+        dist.send(x.contiguous(), dst=dst_rank)
+
+    def recv_forward(self, shape: torch.Size, src_rank: int, device: torch.device):
+        """
+        Receive activations from previous stage.
+        """
+        x = torch.empty(shape, device=device)
+        dist.recv(x, src=src_rank)
+        return x
+
+    def send_backward(self, grad: torch.Tensor, dst_rank: int):
+        """
+        Send gradients backward.
+        """
+        dist.send(grad.contiguous(), dst=dst_rank)
+
+    def recv_backward(self, shape: torch.Size, src_rank: int, device: torch.device):
+        """
+        Receive gradients from next stage.
+        """
+        g = torch.empty(shape, device=device)
+        dist.recv(g, src=src_rank)
+        return g
+# ============================================================
+# Section 6: Expert Parallelism (EP) for MoE
+# ============================================================
+
+class DistributedMoEHead(torch.nn.Module):
+    """
+    Distributed Mixture-of-Experts (MoE) with Expert Parallelism (EP).
+
+    Why EP?
+    -------
+    - A Mixture-of-Experts layer contains many "expert" sub-networks.
+    - A router decides which experts to use for each token (typically top-k).
+    - If all experts were stored on each GPU, memory would explode.
+    - Instead, we shard experts across GPUs (EP).
+    - Router decisions are followed by all-to-all communication:
+        * Each GPU sends tokens to the GPUs holding the selected experts.
+        * Each GPU computes on its local experts.
+        * Results are sent back and combined.
+
+    This class demonstrates a simplified version of EP.
+    """
+
+    def __init__(self, input_dim: int, output_dim: int,
+                 num_experts: int, top_k: int,
+                 process_group: Optional[dist.ProcessGroup] = None):
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.pg = process_group if process_group is not None else dist.group.WORLD
+        self.ep_world_size = dist.get_world_size(self.pg)
+        self.ep_rank = dist.get_rank(self.pg)
+
+        assert num_experts % self.ep_world_size == 0, "Experts must divide evenly across EP ranks"
+        self.local_experts = num_experts // self.ep_world_size
+
+        # Router: simple linear projection to logits over experts
+        self.router = torch.nn.Linear(input_dim, num_experts)
+
+        # Local expert networks (here, simple feedforward)
+        self.experts = torch.nn.ModuleList([
+            torch.nn.Sequential(
+                torch.nn.Linear(input_dim, 4*input_dim),
+                torch.nn.GELU(),
+                torch.nn.Linear(4*input_dim, output_dim)
+            )
+            for _ in range(self.local_experts)
+        ])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass with expert parallelism.
+        x: [batch, hidden]
+
+        Steps:
+        1. Router produces logits over experts.
+        2. Top-k experts chosen for each token.
+        3. Tokens dispatched to the ranks holding those experts (all-to-all).
+        4. Local experts compute outputs.
+        5. Outputs combined and returned.
+        """
+        bsz, hidden = x.shape
+
+        # 1. Router
+        logits = self.router(x)  # [batch, num_experts]
+        topk_scores, topk_indices = torch.topk(logits, self.top_k, dim=-1)
+
+        # 2. Build dispatch mask
+        # dispatch[i, e] = weight if token i assigned to expert e
+        dispatch_mask = torch.zeros(bsz, self.num_experts, device=x.device)
+        dispatch_mask.scatter_(1, topk_indices, torch.softmax(topk_scores, dim=-1))
+
+        # 3. Split tokens per rank (which experts live here?)
+        expert_range = range(self.ep_rank*self.local_experts,
+                             (self.ep_rank+1)*self.local_experts)
+        local_mask = dispatch_mask[:, list(expert_range)]  # [batch, local_experts]
+
+        # Compute how many tokens per local expert
+        token_indices = []
+        for j in range(self.local_experts):
+            assigned = (local_mask[:, j] > 0).nonzero(as_tuple=True)[0]
+            token_indices.append(assigned)
+
+        # 4. Local expert compute
+        outputs = torch.zeros(bsz, self.output_dim, device=x.device)
+        for j, idx in enumerate(token_indices):
+            if len(idx) == 0:
+                continue
+            x_j = x[idx]  # tokens for expert j
+            out_j = self.experts[j](x_j)
+            weight = local_mask[idx, j].unsqueeze(-1)  # soft routing weight
+            outputs[idx] += weight * out_j
+
+        # 5. Allreduce to aggregate outputs from all EP ranks
+        dist.all_reduce(outputs, group=self.pg)
+
+        return outputs
+# ============================================================
+# Section 7: Hybrid Model (combining TP, PP, EP)
+# ============================================================
+
+class HybridBlock(torch.nn.Module):
+    """
+    A simple Transformer-style block that supports:
+    - Tensor Parallel Linear layers (Column/Row partitioned)
+    - Expert Parallel MoE layer (optional)
+    """
+
+    def __init__(self, hidden_size: int, ffn_hidden_size: int,
+                 use_moe: bool = False, num_experts: int = 0, top_k: int = 1,
+                 tp_group: Optional[dist.ProcessGroup] = None,
+                 ep_group: Optional[dist.ProcessGroup] = None):
+        super().__init__()
+        self.use_moe = use_moe
+        self.tp_group = tp_group
+        self.ep_group = ep_group
+
+        # Self-attention projection (TP across columns)
+        self.qkv = ColumnParallelLinear(hidden_size, 3*hidden_size, process_group=tp_group)
+        self.proj = RowParallelLinear(hidden_size, hidden_size, process_group=tp_group)
+
+        # Feedforward
+        if use_moe:
+            self.ff = DistributedMoEHead(hidden_size, hidden_size,
+                                         num_experts=num_experts,
+                                         top_k=top_k,
+                                         process_group=ep_group)
+        else:
+            self.ff = torch.nn.Sequential(
+                torch.nn.Linear(hidden_size, ffn_hidden_size),
+                torch.nn.GELU(),
+                torch.nn.Linear(ffn_hidden_size, hidden_size),
+            )
+
+        self.norm1 = torch.nn.LayerNorm(hidden_size)
+        self.norm2 = torch.nn.LayerNorm(hidden_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Self-attention (simplified)
+        qkv = self.qkv(x)
+        q, k, v = torch.chunk(qkv, 3, dim=-1)
+        attn = torch.softmax(q @ k.transpose(-2,-1) / (q.shape[-1]**0.5), dim=-1)
+        h = attn @ v
+        h = self.proj(h)
+        x = x + self.norm1(h)
+
+        # FFN or MoE
+        h2 = self.ff(x)
+        x = x + self.norm2(h2)
+
+        return x
+
+
+class HybridModel(torch.nn.Module):
+    """
+    Build a model according to planner output:
+    - Split layers into PP stages
+    - Inside each stage, use TP for large matrices
+    - Optionally include MoE layers with EP
+    """
+
+    def __init__(self, num_layers: int, hidden_size: int, ffn_hidden_size: int,
+                 vocab_size: int, plan: Plan,
+                 tp_group, pp_group, ep_group, stage_id: int, num_stages: int):
+        super().__init__()
+        self.stage_id = stage_id
+        self.num_stages = num_stages
+        self.pp_group = pp_group
+
+        # Split layers evenly across PP stages
+        layers_per_stage = num_layers // num_stages
+        start = stage_id * layers_per_stage
+        end = (stage_id+1) * layers_per_stage
+
+        blocks = []
+        for i in range(start, end):
+            use_moe = (i % 2 == 0) and (plan.ep > 1)  # every other block uses MoE
+            block = HybridBlock(hidden_size, ffn_hidden_size,
+                                use_moe=use_moe,
+                                num_experts=plan.ep*2,  # simple scaling
+                                top_k=2,
+                                tp_group=tp_group,
+                                ep_group=ep_group)
+            blocks.append(block)
+
+        self.blocks = torch.nn.ModuleList(blocks)
+        self.ln_f = torch.nn.LayerNorm(hidden_size)
+        self.head = torch.nn.Linear(hidden_size, vocab_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for block in self.blocks:
+            x = block(x)
+        x = self.ln_f(x)
+        return self.head(x)
+
+
+# ============================================================
+# Section 8: Training Loop with Hybrid Parallelism
+# ============================================================
+
+def train_loop(model: HybridModel, dataloader, optimizer,
+               device: torch.device, rank: int, plan: Plan,
+               pgm: ProcessGroupManager, epochs: int = 1):
+    """
+    Simplified training loop.
+
+    - Outer layer: DP (Horovod or torch DDP wraps this loop).
+    - Inside model: TP, PP, EP applied as per planner output.
+    - Micro-batch splitting emulates pipeline parallel schedule.
+    """
+
+    model.train()
+    criterion = torch.nn.CrossEntropyLoss()
+
+    for epoch in range(epochs):
+        for step, (x, y) in enumerate(dataloader):
+            # Device placement
+            x = x.to(device)
+            y = y.to(device)
+
+            # Split into micro-batches (for PP)
+            micro_batches = x.chunk(plan.micro_batch, dim=0)
+            y_batches = y.chunk(plan.micro_batch, dim=0)
+
+            losses = []
+            for mb, yb in zip(micro_batches, y_batches):
+                out = model(mb)
+                loss = criterion(out.view(-1, out.size(-1)), yb.view(-1))
+                losses.append(loss)
+
+            loss = torch.stack(losses).mean()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            if rank == 0 and step % 10 == 0:
+                print(f"[Epoch {epoch} Step {step}] Loss = {loss.item():.4f}")
+
+    return model
+# ============================================================
+# Section 9: CLI and Integration
+# ============================================================
+
+import argparse
+from torch.utils.data import Dataset, DataLoader
+
+class DummyDataset(Dataset):
+    """
+    Simple dummy dataset for demonstration.
+    Each sample: random input + random label.
+    """
+    def __init__(self, num_samples: int = 1024, seq_len: int = 32, vocab_size: int = 1000):
+        super().__init__()
+        self.num_samples = num_samples
+        self.seq_len = seq_len
+        self.vocab_size = vocab_size
+
+    def __len__(self):
+        return self.num_samples
 
     def __getitem__(self, idx):
-        return {
-            "x": torch.from_numpy(self.X[idx]),
-            "k": torch.tensor(int(self.k[idx]), dtype=torch.long),
-            "target": torch.tensor(int(self.target[idx]), dtype=torch.long),
-            "y": torch.from_numpy(self.labels[idx]),  # multi-hot over species
-            "biomass": torch.tensor(float(self.biomass[idx]), dtype=torch.float32),
-        }
+        x = torch.randint(0, self.vocab_size, (self.seq_len,))
+        y = torch.randint(0, self.vocab_size, (self.seq_len,))
+        return x, y
 
-# -----------------------------
-# MoE Block
-# -----------------------------
 
-class TopKRouter(nn.Module):
-    def __init__(self, d_in:int, n_experts:int, k:int=2):
-        super().__init__()
-        self.proj = nn.Linear(d_in, n_experts)
-        self.k = k
+def save_plan(plan: Plan, path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(asdict(plan), f, indent=2)
+    print(f"[Planner] Saved plan to {path}")
 
-    def forward(self, x):
-        # x: [B, d]
-        logits = self.proj(x)                         # [B, E]
-        gates = F.softmax(logits, dim=-1)             # [B, E]
-        topk_val, topk_idx = torch.topk(gates, self.k, dim=-1)  # [B, k]
-        # Normalize selected gates so they sum to 1
-        topk_val = topk_val / (topk_val.sum(dim=-1, keepdim=True) + 1e-9)
-        return topk_idx, topk_val, gates
 
-class ExpertMLP(nn.Module):
-    def __init__(self, d_in:int, d_hidden:int, d_out:int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(d_in, d_hidden),
-            nn.GELU(),
-            nn.Linear(d_hidden, d_out),
-        )
+def load_plan(path: str) -> Plan:
+    with open(path, "r") as f:
+        d = json.load(f)
+    return Plan(**d)
 
-    def forward(self, x): return self.net(x)
-
-class MoEHead(nn.Module):
-    """
-    Local MoE with top-k routing. For distributed EP, replace local dispatch with
-    torch.distributed.all_to_all on (tokens,expert) buckets when available.
-    Outputs species logits.
-    """
-    def __init__(self, d_in:int, n_experts:int, d_hidden:int, n_species:int, topk:int=2):
-        super().__init__()
-        self.router = TopKRouter(d_in, n_experts, k=topk)
-        self.experts = nn.ModuleList([ExpertMLP(d_in, d_hidden, n_species) for _ in range(n_experts)])
-
-    def forward(self, x):
-        # x: [B, d]
-        topk_idx, topk_val, _ = self.router(x)       # [B, k], [B, k]
-        B, k = topk_idx.shape
-        out = 0.0
-        for j in range(k):
-            idx = topk_idx[:, j]                     # [B]
-            val = topk_val[:, j].unsqueeze(-1)       # [B, 1]
-            # Dispatch per expert locally
-            # Build a batch per expert
-            logits = torch.zeros(B, self.experts[0].net[-1].out_features, device=x.device)
-            for e_id, expert in enumerate(self.experts):
-                mask = (idx == e_id)
-                if mask.any():
-                    logits[mask] = expert(x[mask])
-            out = out + val * logits
-        return out  # [B, n_species]
-
-# -----------------------------
-# Predictor Model
-# -----------------------------
-
-class Predictor(nn.Module):
-    """
-    Produce per-species logits from environment features and k.
-    Constraint (must include target species) is applied at inference via masking.
-    """
-    def __init__(self, F:int, n_species:int, n_experts:int=8, d_model:int=256, d_hidden:int=512, topk:int=2):
-        super().__init__()
-        self.fe = nn.Sequential(
-            nn.Linear(F + 1, d_model),  # +1 for 'k' token
-            nn.GELU(),
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-        )
-        self.moe = MoEHead(d_model, n_experts, d_hidden, n_species, topk=topk)
-
-    def forward(self, x, k):
-        k = k.float().unsqueeze(-1)
-        h = self.fe(torch.cat([x, k], dim=-1))
-        logits = self.moe(h)  # [B, n_species]
-        return logits
-
-# -----------------------------
-# Losses & Inference
-# -----------------------------
-
-def multi_hot_bce_with_cardinality(logits, y, k, alpha_card=0.1):
-    """
-    BCE loss for multi-hot labels with an extra penalty to match cardinality (sum ~ k).
-    """
-    bce = F.binary_cross_entropy_with_logits(logits, y, reduction="mean")
-    probs = torch.sigmoid(logits)
-    card_pen = (probs.sum(dim=-1) - k.float()).abs().mean()
-    return bce + alpha_card * card_pen
-
-def select_topk_with_target(logits, k:int, target:int) -> List[int]:
-    """
-    Enforce inclusion of target species. Strategy: force target into set, then pick remaining top (k-1).
-    """
-    probs = torch.sigmoid(logits.detach())
-    k = int(k)
-    target = int(target)
-    probs[..., target] = 1.1  # ensure inclusion
-    topk = torch.topk(probs, k, dim=-1).indices.squeeze(0).tolist()
-    if target not in topk:
-        # replace last with target
-        topk[-1] = target
-    return topk
-
-# -----------------------------
-# Training / Horovod Integration
-# -----------------------------
-
-def init_distributed():
-    rank = 0
-    world = 1
-    local_rank = 0
-    using_hvd = False
-    if HOROVOD:
-        hvd.init()
-        rank = hvd.rank()
-        world = hvd.size()
-        local_rank = hvd.local_rank()
-        if torch.cuda.is_available():
-            torch.cuda.set_device(local_rank)
-        using_hvd = True
-    elif 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        # DDP fallback
-        import torch.distributed as dist
-        dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
-        rank = dist.get_rank(); world = dist.get_world_size()
-        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        if torch.cuda.is_available():
-            torch.cuda.set_device(local_rank)
-    return rank, world, local_rank, using_hvd
-
-def train(root:str="/mnt/data/data_bgs", epochs:int=5, batch_size:int=128,
-          F:int=32, n_species:int=40, n_experts:int=8, topk:int=2,
-          lr:float=3e-4, seed:int=42, hw:Optional[HardwareSpec]=None, ms:Optional[ModelSpec]=None):
-    seed = seed_everything(seed)
-    rank, world, local_rank, using_hvd = init_distributed()
-    device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
-
-    if rank == 0:
-        print(f"[Init] seed={seed} world={world} hvd={using_hvd} device={device}")
-
-    # Profiling-free plan (does not execute any profiling runs)
-    if hw is None: hw = HardwareSpec(num_nodes=1, acc_per_node=world if world>0 else 1)
-    if ms is None: ms = ModelSpec(params_billion=0.05, act_mb_per_sample=6.0, flops_per_sample_giga=20.0,
-                                  experts=n_experts, topk=topk)
-    planner = HybridPlanner(hw, ms)
-    plan = planner.plan(global_batch=batch_size*world, target_micro=4)
-    if rank == 0:
-        print("[Planner]", json.dumps(asdict(plan), indent=2))
-
-    # Data
-    train_ds = BestGroupDataset(root, F=F, species=n_species, split="train", seed=seed)
-    val_ds   = BestGroupDataset(root, F=F, species=n_species, split="val",   seed=seed+1)
-
-    # I/O pipeline to overlap CPU->GPU copies
-    def collate(batch):
-        x = torch.stack([b["x"] for b in batch], dim=0)
-        k = torch.stack([b["k"] for b in batch], dim=0)
-        y = torch.stack([b["y"] for b in batch], dim=0)
-        tgt = torch.stack([b["target"] for b in batch], dim=0)
-        bio = torch.stack([b["biomass"] for b in batch], dim=0)
-        return {"x": x, "k": k, "y": y, "target": tgt, "biomass": bio}
-
-    num_workers = 4 if os.cpu_count() and os.cpu_count() > 4 else 2
-    train_loader = DataLoader(train_ds, batch_size=plan.micro_batch, shuffle=True, drop_last=True,
-                              num_workers=num_workers, pin_memory=True, persistent_workers=True,
-                              prefetch_factor=4, collate_fn=collate)
-    val_loader   = DataLoader(val_ds,   batch_size=plan.micro_batch, shuffle=False, drop_last=False,
-                              num_workers=num_workers, pin_memory=True, persistent_workers=True,
-                              prefetch_factor=4, collate_fn=collate)
-
-    # Model
-    model = Predictor(F=F, n_species=n_species, n_experts=n_experts, d_model=256, d_hidden=512, topk=topk).to(device)
-
-    # Optimizer
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
-
-    if using_hvd:
-        # Horovod: wrap optimizer for distributed allreduce; overlap enabled by default
-        compression = hvd.Compression.fp16 if torch.cuda.is_available() else hvd.Compression.none
-        opt = hvd.DistributedOptimizer(opt, named_parameters=model.named_parameters(),
-                                       compression=compression, op=hvd.Average)
-        hvd.broadcast_parameters(model.state_dict(), root_rank=0)
-        hvd.broadcast_optimizer_state(opt, root_rank=0)
-
-    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
-
-    # Training loop
-    for epoch in range(1, epochs+1):
-        model.train()
-        t0 = time.time()
-        total_loss = 0.0
-        steps = 0
-        for batch in train_loader:
-            x = batch["x"].to(device, non_blocking=True)
-            k = batch["k"].to(device, non_blocking=True)
-            y = batch["y"].to(device, non_blocking=True)
-            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-                logits = model(x, k)
-                loss = multi_hot_bce_with_cardinality(logits, y, k, alpha_card=0.05)
-            opt.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.step(opt)
-            scaler.update()
-            total_loss += loss.item()
-            steps += 1
-        if rank == 0:
-            print(f"[Epoch {epoch}] train_loss={total_loss/max(1,steps):.4f} time={time.time()-t0:.1f}s")
-
-        # quick val
-        if rank == 0 and (epoch % 1 == 0):
-            model.eval()
-            with torch.no_grad():
-                val_loss = 0.0; vsteps=0
-                for batch in val_loader:
-                    x = batch["x"].to(device, non_blocking=True)
-                    k = batch["k"].to(device, non_blocking=True)
-                    y = batch["y"].to(device, non_blocking=True)
-                    logits = model(x, k)
-                    val_loss += F.binary_cross_entropy_with_logits(logits, y, reduction="mean").item()
-                    vsteps += 1
-                print(f"[Epoch {epoch}]   val_loss={val_loss/max(1,vsteps):.4f}")
-
-    # Save
-    if rank == 0:
-        os.makedirs("/mnt/data/artifacts", exist_ok=True)
-        torch.save({"model": model.state_dict(), "config": {
-            "F": F, "n_species": n_species, "n_experts": n_experts, "topk": topk
-        }}, "/mnt/data/artifacts/moe_predictor.pt")
-        with open("/mnt/data/artifacts/plan.json", "w") as f:
-            json.dump(asdict(plan), f, indent=2)
-        print("[Save] Model and plan saved under /mnt/data/artifacts")
-
-# -----------------------------
-# Inference helper
-# -----------------------------
-
-def predict_best_set(model_path:str, x:np.ndarray, k:int, target:int) -> List[int]:
-    ckpt = torch.load(model_path, map_location="cpu")
-    cfg = ckpt["config"]
-    model = Predictor(F=cfg["F"], n_species=cfg["n_species"],
-                      n_experts=cfg["n_experts"], topk=cfg["topk"])
-    model.load_state_dict(ckpt["model"]); model.eval()
-    with torch.no_grad():
-        x_t = torch.tensor(x, dtype=torch.float32).unsqueeze(0)
-        k_t = torch.tensor([k], dtype=torch.long)
-        logits = model(x_t, k_t)
-        sel = select_topk_with_target(logits, k, target)
-    return sel
-
-# -----------------------------
-# CLI
-# -----------------------------
 
 def main():
-    import argparse
-    p = argparse.ArgumentParser()
-    p.add_argument("--data_root", type=str, default="/mnt/data/data_bgs")
-    p.add_argument("--epochs", type=int, default=3)
-    p.add_argument("--batch_size", type=int, default=128)
-    p.add_argument("--F", type=int, default=32)
-    p.add_argument("--species", type=int, default=40)
-    p.add_argument("--experts", type=int, default=8)
-    p.add_argument("--topk", type=int, default=2)
-    p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--seed", type=int, default=42)
-    args = p.parse_args()
+    parser = argparse.ArgumentParser(description="Hybrid Parallel Training Demo with Profiling-Free Planner")
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--hidden-size", type=int, default=128)
+    parser.add_argument("--layers", type=int, default=4)
+    parser.add_argument("--ffn-hidden-size", type=int, default=256)
+    parser.add_argument("--vocab-size", type=int, default=1000)
+    parser.add_argument("--save-plan", type=str, default="./plan.json")
+    parser.add_argument("--load-plan", type=str, default="")
+    args = parser.parse_args()
 
-    # Create placeholder directories and files if missing
-    os.makedirs(args.data_root, exist_ok=True)
-    placeholder = os.path.join(args.data_root, "experimental_biomass_placeholder.csv")
-    if not os.path.exists(placeholder):
-        with open(placeholder, "w") as f:
-            f.write("This is a placeholder for real experimental biomass validation data.\n")
+    # Init distributed
+    if not dist.is_initialized():
+        dist.init_process_group("gloo")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
 
-    train(root=args.data_root, epochs=args.epochs, batch_size=args.batch_size,
-          F=args.F, n_species=args.species, n_experts=args.experts, topk=args.topk,
-          lr=args.lr, seed=args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Hardware/Model specs (example)
+    hw = HardwareSpec(num_nodes=1, acc_per_node=world_size, peak_tflops=20.0, mem_gb=16.0)
+    ms = ModelSpec(params_billion=0.1, act_mb_per_sample=5.0, flops_per_sample_giga=20.0,
+                   experts=8, topk=2)
+
+    # Plan
+    if args.load_plan:
+        plan = load_plan(args.load_plan)
+    else:
+        planner = HybridPlanner(hw, ms)
+        plan = planner.plan(global_batch=args.batch_size * world_size, target_micro=4)
+        if rank == 0:
+            save_plan(plan, args.save_plan)
+
+    # Build process groups
+    pgm = ProcessGroupManager(plan, world_size, rank)
+    pgm.build_groups()
+
+    # Assign stage id
+    stage_id = rank % plan.pp
+    num_stages = plan.pp
+
+    # Build model
+    model = HybridModel(num_layers=args.layers,
+                        hidden_size=args.hidden_size,
+                        ffn_hidden_size=args.ffn_hidden_size,
+                        vocab_size=args.vocab_size,
+                        plan=plan,
+                        tp_group=pgm.tp_group,
+                        pp_group=pgm.pp_group,
+                        ep_group=pgm.ep_group,
+                        stage_id=stage_id,
+                        num_stages=num_stages).to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    # Data
+    dataset = DummyDataset(num_samples=512, seq_len=32, vocab_size=args.vocab_size)
+    dataloader = DataLoader(dataset, batch_size=plan.micro_batch, shuffle=True)
+
+    # Train
+    train_loop(model, dataloader, optimizer, device, rank, plan, pgm, epochs=args.epochs)
+
+    if rank == 0:
+        print("[Training Completed]")
+
 
 if __name__ == "__main__":
     main()
